@@ -1,16 +1,18 @@
 import torch
 from torch import nn
 
+
 class Transpose(nn.Module):
-""" A simple module to transpose the dimensions of a tensor. """
+    """A simple module to transpose two tensor dimensions."""
 
     def __init__(self, d_1, d_2):
         super().__init__()
-        
+
         self.dims = (d_1, d_2)
 
     def forward(self, x):
         return x.transpose(*self.dims)
+
 
 class Tokenizer(nn.Module):
     """ A module to tokenize an image into patches and reconstruct it back. """
@@ -20,7 +22,7 @@ class Tokenizer(nn.Module):
 
         self.unfold = nn.Sequential(
             nn.Unfold(kernel_size=patch_size, stride=patch_size),
-            Transpose(1, 2)
+            Transpose(1, 2),
         )
 
         self.fold = nn.Sequential(
@@ -38,7 +40,7 @@ class Tokenizer(nn.Module):
         Returns:
             torch.Tensor: Output tensor of shape (batch_size, num_patches, patch_size * patch_size * channels).
         """
-        return self.unfold(x.unsqueeze(1))
+        return self.unfold(x)
     
     def decode(self, x):
         """
@@ -50,10 +52,31 @@ class Tokenizer(nn.Module):
         Returns:
             torch.Tensor: Output tensor of shape (batch_size, channels, height, width).
         """
-        return self.fold(x).squeeze(1)
+        return self.fold(x)
 
-class VisionTransformer(nn.Module):
-    """ A simple implementation of a Vision Transformer (ViT) model. """
+class PatchEmbedding(nn.Module):
+    """ A module to embed the patches into a higher-dimensional space. """
+
+    def __init__(self, patch_size, n_embed):
+        super().__init__()
+
+        self.linear = nn.Linear(patch_size * patch_size * 3, n_embed)
+
+    def forward(self, x):
+        """
+        Embeds the patches into a higher-dimensional space.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, num_patches, patch_size * patch_size * channels).
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, num_patches, n_embed).
+        """
+        return self.linear(x)
+
+
+class TransformerEncoderBlock(nn.Module):
+    """A standard Transformer encoder block for vision tokens."""
 
     def __init__(self, n_embed, n_head):
         """
@@ -62,12 +85,14 @@ class VisionTransformer(nn.Module):
             n_head: The number of attention heads.
         """
         super().__init__()
-        self.mha = nn.MultiheadAttention(n_embed, n_head)
-        self.norm = nn.LayerNorm(n_embed)
+
+        self.ln1 = nn.LayerNorm(n_embed)
+        self.mha = nn.MultiheadAttention(n_embed, n_head, batch_first=True)
+        self.ln2 = nn.LayerNorm(n_embed)
         self.ffn = nn.Sequential(
             nn.Linear(n_embed, n_embed * 4),
-            nn.ReLU(),
-            nn.Linear(n_embed * 4, n_embed)
+            nn.GELU(), # The ViT paper uses GELU activation function
+            nn.Linear(n_embed * 4, n_embed),
         )
 
     def forward(self, x):
@@ -75,12 +100,47 @@ class VisionTransformer(nn.Module):
         Forward pass of the Vision Transformer.
 
         Args:
-            x (torch.Tensor): Input tensor of shape (seq_len, batch_size, n_embed).
+            x (torch.Tensor): Input tensor of shape (batch_size, seq_len, n_embed).
         """
-        normed_x = self.norm(x)
-        attn_output, _ = self.mha(normed_x, normed_x, normed_x)
-        x = x + attn_output  # Residual connection
-        normed_x = self.norm(x)
-        ffn_output = self.ffn(normed_x)
-        x = x + ffn_output  # Residual connection
+        normed_x = self.ln1(x)
+        x = x + self.mha(normed_x, normed_x, normed_x)[0]
+        x = x + self.ffn(self.ln2(x)) 
+        return x
+
+
+class ViT(nn.Module):
+    """A simple Vision Transformer (ViT) model for encoding images into patch-level embeddings."""
+
+    def __init__(self, img_size, patch_size, n_embed, n_head, n_layers):
+        """
+        Initializes the Vision Transformer model that consists of a tokenizer, patch embedding, and multiple Transformer encoder blocks.
+
+        Args:
+            img_size (int | tuple[int, int]): Input image size (H, W).
+            patch_size (int | tuple[int, int]): Patch size (Ph, Pw).
+            n_embed (int): Embedding dimension.
+            n_head (int): Number of attention heads.
+            n_layers (int): Number of Transformer encoder blocks.
+        """
+        super().__init__()
+
+        self.tokenizer = Tokenizer(img_size, patch_size)
+        self.patch_embedding = PatchEmbedding(patch_size, n_embed)
+        self.transformer_blocks = nn.ModuleList([
+            TransformerEncoderBlock(n_embed, n_head) for _ in range(n_layers)
+        ])
+
+    def forward(self, x):
+        """
+        Forward pass of the Vision Transformer encoder that encodes the input image into patch-level embeddings.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, channels, height, width).
+        Returns:
+            torch.Tensor: Patch-level embeddings tensor of shape (batch_size, num_patches, n_embed).
+        """
+        x = self.tokenizer.encode(x)
+        x = self.patch_embedding(x)
+        for block in self.transformer_blocks:
+            x = block(x)
         return x
