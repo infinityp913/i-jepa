@@ -63,6 +63,22 @@ embeddings = model(x)             # (4, 196, 768) — 196 patches of dim 768
 
 ---
 
+## Design Decisions
+
+### Positional Embeddings
+
+We use **learnable positional embeddings** (added to patch tokens after projection), matching the original I-JEPA and ViT papers.
+
+We considered two alternatives:
+
+**ALiBi** — adds a distance-based negative bias to attention scores, requiring no learnable parameters and generalising to unseen sequence lengths. Rejected because its distance penalty suppresses attention between far-apart patches. In I-JEPA, context and target blocks are deliberately non-overlapping and spatially distant; suppressing that cross-region attention directly undermines the predictor's task.
+
+**RoPE (Rotary Position Embeddings)** — encodes position by rotating Q/K vectors, providing relative position information without a distance penalty. Distant patches can still attend freely, and the position is baked into each query/key so mask tokens at target locations are inherently position-aware. RoPE is the strongest candidate for a future improvement, particularly if we want resolution generalisation (training at 224×224, inferring at higher resolutions).
+
+For now, learnable embeddings keep the implementation faithful to the paper. RoPE can be explored as a future enhancement.
+
+---
+
 ## Paper
 
 ```bibtex
