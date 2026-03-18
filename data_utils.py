@@ -78,6 +78,7 @@ class MaskCollator:
         with i.get_lock():
             i.value += 1
             v = i.value
+        
         return v
 
     def _sample_block_size(self, generator, scale, aspect_ratio_scale):
@@ -92,14 +93,13 @@ class MaskCollator:
         min_ar, max_ar = aspect_ratio_scale
         aspect_ratio = min_ar + _rand * (max_ar - min_ar)
 
-        # h, w in patch units
-        h = int(round(math.sqrt(max_keep * aspect_ratio)))
-        w = int(round(math.sqrt(max_keep / aspect_ratio)))
-
         # clamp to grid size
-        return min(h, self.height), min(w, self.width)
+        return (
+            min(int(round(math.sqrt(max_keep * aspect_ratio))), self.height), 
+            min(int(round(math.sqrt(max_keep / aspect_ratio))), self.width)
+        )
 
-    def _sample_block_mask(self, b_size, acceptable_regions=[]):
+    def _sample_block_mask(self, b_size, acceptable_regions=[], tries=20):
         """
         Sample a rectangular block at a random position on the patch grid.
 
@@ -115,28 +115,29 @@ class MaskCollator:
         """
         h, w = b_size
 
-        tries = len(acceptable_regions) 
-        timeout = 20
-        valid_mask = False
-        while not valid_mask:
+        for _ in range(tries):
             top = torch.randint(0, self.height - h + 1, (1,))
             left = torch.randint(0, self.width - w + 1, (1,))
+            
             mask = torch.zeros((self.height, self.width), dtype=torch.int32)
-            mask[top: top + h, left: left + w] = 1 
-            for i in range(tries): mask *= acceptable_regions[i]
-            mask = torch.nonzero(mask.flatten()).squeeze()
-            valid_mask = len(mask) > self.min_keep
-            if not valid_mask:
-                timeout -= 1
-                if timeout == 0:
-                    tries -= 1
-                    timeout = 20 # Reset timeout
-                    logger.warning(f"MaskCollator: valid mask not found, relaxing acceptable regions [{tries}]")
+            mask[top: top + h, left: left + w] = 1
+            
+            if acceptable_regions: 
+                for tm in acceptable_regions: mask *= tm
+            
+            mask_indices = torch.nonzero(mask.flatten()).flatten()
+            
+            if mask_indices.numel() >= self.min_keep: break
+        else:
+            if acceptable_regions:
+                logger.warning(f"MaskCollator: valid mask not found, relaxing acceptable regions [{len(acceptable_regions) - 1}]") 
+                
+                return self._sample_block_mask(b_size, acceptable_regions[:-1], tries)
 
         mask_complement = torch.ones((self.height, self.width), dtype=torch.int32)
         mask_complement[top: top + h, left: left + w] = 0
 
-        return mask, mask_complement
+        return mask_indices, mask_complement
 
     def __call__(self, batch):
         """
@@ -157,11 +158,10 @@ class MaskCollator:
             collated_enc    : list[Tensor]  length nenc, each [B, min_keep_enc]
             collated_pred   : list[Tensor]  length npred, each [B, min_keep_pred]
         """
-        collated_batch = torch.utils.data.default_collate(batch)
-
         # -- shared per-batch seed for block *sizes*
         g = torch.Generator()
         g.manual_seed(self.step())
+        
         p_size = self._sample_block_size(
             generator=g,
             scale=self.pred_mask_scale,
@@ -170,12 +170,11 @@ class MaskCollator:
         e_size = self._sample_block_size(
             generator=g,
             scale=self.enc_mask_scale,
-            aspect_ratio_scale=(1.0, 1.0),  # square context block
+            aspect_ratio_scale=(1.0, 1.0),
         )
 
         collated_masks_pred, collated_masks_enc = [], []
-        min_keep_pred = self.height * self.width
-        min_keep_enc = self.height * self.width
+        min_keep_enc = min_keep_pred = self.height * self.width
 
         for _ in range(len(batch)):
             # predictor (target) masks
@@ -189,7 +188,6 @@ class MaskCollator:
 
             # encoder (context) masks — no overlap with predictor blocks
             acceptable_regions = [] if self.allow_overlap else masks_C
-
             masks_e = []
             for _ in range(self.nenc):
                 mask = self._sample_block_mask(e_size, acceptable_regions=acceptable_regions)[0]
@@ -198,15 +196,15 @@ class MaskCollator:
             collated_masks_enc.append(masks_e)
 
         # truncate to min kept across the batch so tensors are stackable
-        collated_masks_pred = torch.utils.data.default_collate([
-            [cm[:min_keep_pred] for cm in cm_list] for cm_list in collated_masks_pred
-        ])
-
-        collated_masks_enc = torch.utils.data.default_collate([
-            [cm[:min_keep_enc] for cm in cm_list] for cm_list in collated_masks_enc
-        ])
-
-        return collated_batch, collated_masks_enc, collated_masks_pred
+        return (
+            torch.utils.data.default_collate(batch), 
+            torch.utils.data.default_collate([
+                [cm[:min_keep_enc] for cm in cm_list] for cm_list in collated_masks_enc
+            ]), 
+            torch.utils.data.default_collate([
+                [cm[:min_keep_pred] for cm in cm_list] for cm_list in collated_masks_pred
+            ])
+        )
 
 def apply_masks(x, masks):
     """
@@ -234,9 +232,7 @@ class ImageNetDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         example = self.hf_dataset[idx]
-        image = example["image"].convert("RGB")
-        label = example["label"]
-        return self.transform(image), label
+        return self.transform(example["image"].convert("RGB")), example["label"]
 
 def make_imagenet(
     transform,
@@ -279,12 +275,15 @@ def make_imagenet(
 
     if os.path.isdir(split_dir):
         hf_dataset = load_from_disk(split_dir)
+        
         logger.info(f"Dataset loaded from disk — {len(hf_dataset)} images ({local_name}, {split})")
     else:
         if dataset_name is None: raise FileNotFoundError(f"No cached dataset at {split_dir}. Provide dataset_name to download it first.")
+        
         hf_dataset = load_dataset(dataset_name, split=split)
         os.makedirs(split_dir, exist_ok=True)
         hf_dataset.save_to_disk(split_dir)
+        
         logger.info(f"Dataset downloaded and saved — {len(hf_dataset)} images ({dataset_name}, {split})")
 
     data_loader = torch.utils.data.DataLoader(
@@ -297,11 +296,12 @@ def make_imagenet(
         num_workers=num_workers,
         persistent_workers=(num_workers > 0),
     )
+    
     logger.info("DataLoader created")
 
     return data_loader
 
-def overlay_mask_on_image(image, mask_indices, patch_size, grid_size, darken=0.80):
+def _overlay_mask_on_image(image, mask_indices, patch_size, grid_size, darken=0.80):
     grid_h, grid_w = grid_size
     mask_grid = torch.zeros((grid_h, grid_w), device=image.device, dtype=torch.float32)
     if mask_indices.numel() > 0:
@@ -325,7 +325,7 @@ def main():
         split="test"
     )
 
-    for (images, _), enc_masks, pred_masks in data_loader:
+    for (images, labels), enc_masks, pred_masks in data_loader:
         image = images[0]
 
         masks_to_plot = []
@@ -339,7 +339,7 @@ def main():
         axes = axes.flatten()
 
         for ax, (title, mask_indices) in zip(axes, masks_to_plot):
-            overlay = overlay_mask_on_image(
+            overlay = _overlay_mask_on_image(
                 image=image,
                 mask_indices=mask_indices,
                 patch_size=collator.patch_size,
