@@ -35,10 +35,17 @@ All components are implemented from scratch in PyTorch with no external vision l
 ```bash
 git clone https://github.com/<your-username>/i-jepa.git
 cd i-jepa
-pip install torch
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
 ```
 
-No additional dependencies required.
+## Running tests
+
+```bash
+source .venv/bin/activate
+pytest tests/ -v
+```
 
 ---
 

@@ -57,10 +57,17 @@ class Tokenizer(nn.Module):
 class PatchEmbedding(nn.Module):
     """ A module to embed the patches into a higher-dimensional space. """
 
-    def __init__(self, patch_size, n_embed):
-        super().__init__()
+    def __init__(self, patch_size, n_embed, img_channels=3):
+        """
+        Initialize patch embedding layer.
 
-        self.linear = nn.Linear(patch_size * patch_size * 3, n_embed)
+        Args:
+            patch_size (int): Square patch size (paper default: 16).
+            n_embed (int): The dimensionality of the embedding space.
+            img_channels (int): Number of channels in the input image (default is 3 for RGB images).
+        """
+        super().__init__()
+        self.linear = nn.Linear(patch_size * patch_size * img_channels, n_embed)
 
     def forward(self, x):
         """
@@ -111,21 +118,28 @@ class TransformerEncoderBlock(nn.Module):
 class ViT(nn.Module):
     """A simple Vision Transformer (ViT) model for encoding images into patch-level embeddings."""
 
-    def __init__(self, img_size, patch_size, n_embed, n_head, n_layers):
+    def __init__(self, img_size, patch_size=16, n_embed=768, n_head=12, n_layers=12, img_channels=3):
         """
         Initializes the Vision Transformer model that consists of a tokenizer, patch embedding, and multiple Transformer encoder blocks.
 
         Args:
-            img_size (int | tuple[int, int]): Input image size (H, W).
-            patch_size (int | tuple[int, int]): Patch size (Ph, Pw).
-            n_embed (int): Embedding dimension.
-            n_head (int): Number of attention heads.
-            n_layers (int): Number of Transformer encoder blocks.
+            img_size (int): Square input image size (e.g. 224 for ImageNet).
+            patch_size (int): Square patch size (paper default: 16).
+            n_embed (int): Embedding dimension (paper default: 768).
+            n_head (int): Number of attention heads (paper default: 12).
+            n_layers (int): Number of Transformer encoder blocks (paper default: 12).
+            img_channels (int): Number of input image channels (default: 3 for RGB).
         """
         super().__init__()
 
         self.tokenizer = Tokenizer(img_size, patch_size)
-        self.patch_embedding = PatchEmbedding(patch_size, n_embed)
+
+        num_patches = (img_size // patch_size) ** 2
+
+        self.positional_embedding = nn.Parameter(torch.randn(1, num_patches, n_embed))
+        nn.init.trunc_normal_(self.positional_embedding, std=0.02)  # Initialize positional embeddings with truncated normal distribution
+
+        self.patch_embedding = PatchEmbedding(patch_size, n_embed, img_channels)
         self.transformer_blocks = nn.ModuleList([
             TransformerEncoderBlock(n_embed, n_head) for _ in range(n_layers)
         ])
@@ -141,6 +155,7 @@ class ViT(nn.Module):
         """
         x = self.tokenizer.encode(x)
         x = self.patch_embedding(x)
+        x = x + self.positional_embedding
         for block in self.transformer_blocks:
             x = block(x)
         return x
