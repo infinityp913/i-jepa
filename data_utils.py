@@ -114,7 +114,7 @@ class MaskCollator:
             mask_complement : 2-D binary tensor (H, W) with 0 inside the block, 1 outside
         """
         h, w = b_size
-        acceptable_region = math.prod(acceptable_regions)
+        valid_patch_mask = math.prod(acceptable_regions)
 
         for _ in range(tries):
             top = torch.randint(0, self.height - h + 1, (1,))
@@ -122,7 +122,7 @@ class MaskCollator:
             
             mask = torch.zeros((self.height, self.width), dtype=torch.int32)
             mask[top: top + h, left: left + w] = 1
-            mask *= acceptable_region
+            mask *= valid_patch_mask
             
             mask_indices = torch.nonzero(mask.flatten()).flatten()
             
