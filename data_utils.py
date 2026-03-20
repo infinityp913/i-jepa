@@ -318,7 +318,7 @@ def main():
     collator = MaskCollator()
 
     data_loader = make_imagenet(
-        dataset_name="timm/mini-imagenet",
+        dataset_name="timm/mini-imagenet", # only specify the first time to download
         local_name="mini-imagenet",
         transform=make_transforms(normalization=(0, 1)), # for visuslization, no normalization
         collator=collator,
