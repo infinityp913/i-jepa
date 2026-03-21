@@ -133,11 +133,11 @@ class Encoder(nn.Module):
         super().__init__()
         num_patches = (img_size // patch_size) ** 2
 
-        self.positional_embedding = nn.Parameter(torch.randn(1, num_patches, n_embed))
+        self.positional_embedding = nn.Parameter(torch.randn(num_patches, n_embed))
         nn.init.trunc_normal_(self.positional_embedding, std=0.02)  # Initialize positional embeddings with truncated normal distribution
 
         self.patch_embedding = PatchEmbedding(patch_size, n_embed, img_channels)
-        self.transformer_blocks = nn.Sequential([TransformerBlock(n_embed, n_head) for _ in range(n_layers)])
+        self.transformer_blocks = nn.Sequential(*[TransformerBlock(n_embed, n_head) for _ in range(n_layers)])
 
     def forward(self, x, masks):
         """
@@ -149,8 +149,7 @@ class Encoder(nn.Module):
         Returns:
             torch.Tensor: Embeddings of kept patches [B, n_keep, n_embed].
         """
-        x = self.patch_embedding(x)                          # [B, n_keep, n_embed]
-        x = x + self.positional_embedding[:, masks]   # positional emb for kept positions only
+        x = self.patch_embedding(x) + self.positional_embedding[masks]   # positional emb for kept positions only
         x = self.transformer_blocks(x)
         return x
 
@@ -171,10 +170,10 @@ class Predictor(nn.Module):
         super().__init__()
         num_patches = (img_size // patch_size) ** 2
 
-        self.mask_token = nn.Parameter(torch.zeros(1, 1, n_embed))
+        self.mask_token = nn.Parameter(torch.zeros(n_embed))
         nn.init.trunc_normal_(self.mask_token, std=0.02)
 
-        self.positional_embedding = nn.Parameter(torch.randn(1, num_patches, n_embed))
+        self.positional_embedding = nn.Parameter(torch.randn(num_patches, n_embed))
         nn.init.trunc_normal_(self.positional_embedding, std=0.02)
 
         self.transformer_blocks = nn.Sequential(*[TransformerBlock(n_embed, n_head) for _ in range(n_layers)])
@@ -190,17 +189,13 @@ class Predictor(nn.Module):
         Returns:
             torch.Tensor: Predicted embeddings at target positions [B, n_keep_pred, n_embed].
         """
-        B, _, D = x.shape
-
         # add positional encoding to context tokens
-        x_ctx = x + self.positional_embedding[:, context_masks]
+        x_ctx = x + self.positional_embedding[context_masks]
 
         # build mask tokens and add positional encoding for target positions
-        mask_tokens = self.mask_token.expand(B, target_masks.shape[1], D)
-        x_pred = mask_tokens + self.positional_embedding[:, target_masks]
+        x_pred = self.mask_token.expand(*target_masks.shape, -1) + self.positional_embedding[target_masks]
 
-        x = torch.cat([x_ctx, x_pred], dim=1)
-        x = self.transformer_blocks(x)
+        x = self.transformer_blocks(torch.cat([x_ctx, x_pred], dim=1))
 
         # return only the predictions for the target positions
         return x[:, x_ctx.shape[1]:]
