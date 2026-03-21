@@ -2,11 +2,10 @@ import math
 import logging
 from multiprocessing import Value
 import os
-
-import matplotlib.pyplot as plt
 import torch
 import torchvision.transforms as transforms
 from datasets import load_dataset, load_from_disk
+
 
 logger = logging.getLogger(__name__)
 _DATASETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "datasets")
@@ -99,12 +98,12 @@ class MaskCollator:
             min(int(round(math.sqrt(max_keep / aspect_ratio))), self.width)
         )
 
-    def _sample_block_mask(self, b_size, acceptable_regions=[], tries=20):
+    def _sample_block_mask(self, block_size, acceptable_regions=[], tries=20):
         """
         Sample a rectangular block at a random position on the patch grid.
 
         Args:
-            b_size: (h, w) block size in patch units.
+            block_size: (h, w) block size in patch units.
             acceptable_regions: optional list of 2‑D binary masks that the
                 sampled block must partially lie within (used to remove
                 overlap with predictor blocks from the encoder mask).
@@ -113,7 +112,7 @@ class MaskCollator:
             mask            : 1-D tensor of flattened patch indices inside the block
             mask_complement : 2-D binary tensor (H, W) with 0 inside the block, 1 outside
         """
-        h, w = b_size
+        h, w = block_size
         valid_patch_mask = math.prod(acceptable_regions)
 
         for _ in range(tries):
@@ -131,7 +130,7 @@ class MaskCollator:
             if acceptable_regions:
                 logger.warning(f"MaskCollator: valid mask not found, relaxing acceptable regions [{len(acceptable_regions) - 1}]") 
                 
-                return self._sample_block_mask(b_size, acceptable_regions[:-1], tries)
+                return self._sample_block_mask(block_size, acceptable_regions[:-1], tries)
 
         mask_complement = torch.ones((self.height, self.width), dtype=torch.int32)
         mask_complement[top: top + h, left: left + w] = 0
@@ -198,10 +197,12 @@ class MaskCollator:
         return (
             torch.utils.data.default_collate(batch), 
             torch.utils.data.default_collate([
-                [cm[:min_keep_enc] for cm in cm_list] for cm_list in collated_masks_enc
+                [cm[:min_keep_enc] for cm in cm_list] 
+                for cm_list in collated_masks_enc
             ]), 
             torch.utils.data.default_collate([
-                [cm[:min_keep_pred] for cm in cm_list] for cm_list in collated_masks_pred
+                [cm[:min_keep_pred] for cm in cm_list] 
+                for cm_list in collated_masks_pred
             ])
         )
 
@@ -235,7 +236,7 @@ class ImageNetDataset(torch.utils.data.Dataset):
 
 def make_imagenet(
     transform,
-    batch_size,
+    batch_size=1,
     dataset_name=None,
     local_name=None,
     collator=None,
@@ -300,32 +301,33 @@ def make_imagenet(
 
     return data_loader
 
-def _overlay_mask_on_image(image, mask_indices, patch_size, grid_size, darken=0.80):
+def _overlay_mask_on_image(image, mask_indices, patch_size, grid_size, darken=0.65):
+    """Overlay a mask on an image, only for visualization."""
     grid_h, grid_w = grid_size
+    mask_indices = mask_indices.flatten().to(torch.long)
     mask_grid = torch.zeros((grid_h, grid_w), device=image.device, dtype=torch.float32)
-    if mask_indices.numel() > 0:
-        mask_indices = mask_indices.flatten().to(torch.long)
-        rows = torch.div(mask_indices, grid_w, rounding_mode="floor")
-        cols = mask_indices % grid_w
-        mask_grid[rows, cols] = 1.0
-    mask_pixels = mask_grid.repeat_interleave(patch_size, dim=0).repeat_interleave(patch_size, dim=1)
-    mask_pixels = mask_pixels[: image.shape[1], : image.shape[2]] 
-    return image * (mask_pixels * darken)
+    mask_grid[torch.div(mask_indices, grid_w, rounding_mode="floor"), mask_indices % grid_w] = 1.0
+    mask_pixels = mask_grid.repeat_interleave(patch_size, dim=0).repeat_interleave(patch_size, dim=1)[: image.shape[1], : image.shape[2]]
+    return image * mask_pixels * darken
 
 def main():
+    from vit import Tokenizer
+    import matplotlib.pyplot as plt
+
+    tokenizer = Tokenizer(img_size=224, patch_size=16)
     collator = MaskCollator()
 
     data_loader = make_imagenet(
-        dataset_name="timm/mini-imagenet",
+        dataset_name="timm/mini-imagenet", # only specify the first time to download
         local_name="mini-imagenet",
-        transform=make_transforms(),
-        batch_size=1,
+        transform=make_transforms(normalization=(0, 1)), # for visuslization, no normalization
         collator=collator,
         split="test"
     )
 
     for (images, labels), enc_masks, pred_masks in data_loader:
-        image = images[0]
+        print(apply_masks(tokenizer.encode(images), enc_masks).shape)
+        print(apply_masks(tokenizer.encode(images), pred_masks).shape)
 
         masks_to_plot = []
         for i, mask in enumerate(enc_masks): masks_to_plot.append((f"enc {i}", mask[0]))
@@ -339,7 +341,7 @@ def main():
 
         for ax, (title, mask_indices) in zip(axes, masks_to_plot):
             overlay = _overlay_mask_on_image(
-                image=image,
+                image=images[0],
                 mask_indices=mask_indices,
                 patch_size=collator.patch_size,
                 grid_size=(collator.height, collator.width),

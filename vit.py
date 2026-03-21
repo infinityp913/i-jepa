@@ -67,7 +67,7 @@ class PatchEmbedding(nn.Module):
             img_channels (int): Number of channels in the input image (default is 3 for RGB images).
         """
         super().__init__()
-        self.linear = nn.Linear(patch_size * patch_size * img_channels, n_embed)
+        self.linear = nn.Linear(patch_size ** 2 * img_channels, n_embed)
 
     def forward(self, x):
         """
@@ -82,8 +82,8 @@ class PatchEmbedding(nn.Module):
         return self.linear(x)
 
 
-class TransformerEncoderBlock(nn.Module):
-    """A standard Transformer encoder block for vision tokens."""
+class TransformerBlock(nn.Module):
+    """A standard Transformer block for vision tokens."""
 
     def __init__(self, n_embed, n_head):
         """
@@ -113,7 +113,7 @@ class TransformerEncoderBlock(nn.Module):
             torch.Tensor: Output tensor of shape (batch_size, seq_len, n_embed).
         """
         normed_x = self.ln1(x)
-        x = x + self.mha(normed_x, normed_x, normed_x)[0]
+        x = x + self.mha(normed_x, normed_x, normed_x, need_weights=False)[0] # need_weights=False uses the optimized scaled_dot_product_attention
         x = x + self.ffn(self.ln2(x)) 
         return x
 
@@ -149,7 +149,7 @@ class ViTContextEncoder(nn.Module):
 
     def __init__(self, img_size, patch_size=16, n_embed=768, n_head=12, n_layers=12, img_channels=3):
         """
-        Initializes the Vision Transformer model that consists of a tokenizer, patch embedding, and multiple Transformer encoder blocks.
+        Initializes the Encoder.
 
         Args:
             img_size (int): Square input image size (e.g. 224 for ImageNet).
@@ -160,24 +160,62 @@ class ViTContextEncoder(nn.Module):
             img_channels (int): Number of input image channels (default: 3 for RGB).
         """
         super().__init__()
-
-        self.tokenizer = Tokenizer(img_size, patch_size)
-
         num_patches = (img_size // patch_size) ** 2
 
-        self.positional_embedding = nn.Parameter(torch.randn(1, num_patches, n_embed))
+        self.positional_embedding = nn.Parameter(torch.randn(num_patches, n_embed))
         nn.init.trunc_normal_(self.positional_embedding, std=0.02)  # Initialize positional embeddings with truncated normal distribution
 
         self.patch_embedding = PatchEmbedding(patch_size, n_embed, img_channels)
         
         self.vit = ViT(n_embed, n_head, n_layers)
 
-    def forward(self, x):
+    def forward(self, x, masks):
         """
-        Forward pass of the Vision Transformer encoder that encodes the input image into patch-level embeddings.
+        Forward pass of the Encoder.
 
         Args:
-            x (torch.Tensor): Input tensor of shape (batch_size, channels, height, width).
+            x (torch.Tensor): Kept patches [B, n_keep, patch_size**2 * img_channels].
+            masks (torch.Tensor): Patch indices to keep [B, n_keep].
+        Returns:
+            torch.Tensor: Embeddings of kept patches [B, n_keep, n_embed].
+        """
+        x = self.patch_embedding(x) + self.positional_embedding[masks]   # positional emb for kept positions only
+        x = self.transformer_blocks(x)
+        return x
+
+class Predictor(nn.Module):
+    """A Transformer based predictor for predicting the masked patches."""
+
+    def __init__(self, img_size, patch_size=16, n_embed=768, n_head=12, n_layers=6):
+        """
+        Initializes the Predictor.
+
+        Args:
+            img_size (int): Square input image size (e.g. 224 for ImageNet).
+            patch_size (int): Square patch size (paper default: 16).
+            n_embed (int): Embedding dimension (paper default: 768).
+            n_head (int): Number of attention heads.
+            n_layers (int): Number of Transformer blocks (paper uses a narrower/shallower predictor).
+        """
+        super().__init__()
+        num_patches = (img_size // patch_size) ** 2
+
+        self.mask_token = nn.Parameter(torch.zeros(n_embed))
+        nn.init.trunc_normal_(self.mask_token, std=0.02)
+
+        self.positional_embedding = nn.Parameter(torch.randn(num_patches, n_embed))
+        nn.init.trunc_normal_(self.positional_embedding, std=0.02)
+
+        self.transformer_blocks = nn.Sequential(*[TransformerBlock(n_embed, n_head) for _ in range(n_layers)])
+
+    def forward(self, x, x_masks, y_masks):
+        """
+        Forward pass of the Predictor.
+
+        Args:
+            x (torch.Tensor):             Context encoder outputs [B, n_keep_enc, n_embed].
+            x_masks (torch.Tensor): Patch indices kept by the encoder [B, n_keep_enc].
+            y_masks (torch.Tensor):  Patch indices to predict [B, n_keep_pred].
         Returns:
             torch.Tensor: Patch-level embeddings tensor of shape (batch_size, num_patches, n_embed).
         """
