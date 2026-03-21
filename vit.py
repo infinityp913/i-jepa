@@ -178,24 +178,22 @@ class Predictor(nn.Module):
 
         self.transformer_blocks = nn.Sequential(*[TransformerBlock(n_embed, n_head) for _ in range(n_layers)])
 
-    def forward(self, x, context_masks, target_masks):
+    def forward(self, x, x_masks, y_masks):
         """
         Forward pass of the Predictor.
 
         Args:
             x (torch.Tensor):             Context encoder outputs [B, n_keep_enc, n_embed].
-            context_masks (torch.Tensor): Patch indices kept by the encoder [B, n_keep_enc].
-            target_masks (torch.Tensor):  Patch indices to predict [B, n_keep_pred].
+            x_masks (torch.Tensor): Patch indices kept by the encoder [B, n_keep_enc].
+            y_masks (torch.Tensor):  Patch indices to predict [B, n_keep_pred].
         Returns:
             torch.Tensor: Predicted embeddings at target positions [B, n_keep_pred, n_embed].
         """
         # add positional encoding to context tokens
-        x_ctx = x + self.positional_embedding[context_masks]
+        x = x + self.positional_embedding[x_masks]
 
         # build mask tokens and add positional encoding for target positions
-        x_pred = self.mask_token.expand(*target_masks.shape, -1) + self.positional_embedding[target_masks]
-
-        x = self.transformer_blocks(torch.cat([x_ctx, x_pred], dim=1))
+        y = self.mask_token.expand(*y_masks.shape, -1) + self.positional_embedding[y_masks]
 
         # return only the predictions for the target positions
-        return x[:, x_ctx.shape[1]:]
+        return self.transformer_blocks(torch.cat([x, y], dim=1))[:, x_masks.shape[1]:]
