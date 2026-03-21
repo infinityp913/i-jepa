@@ -1,6 +1,6 @@
 import torch
 import pytest
-from vit import ViT, Tokenizer, PatchEmbedding, TransformerEncoderBlock
+from vit import ViT, ViTContextEncoder, ViTPredictor, Tokenizer, PatchEmbedding, TransformerEncoderBlock
 
 
 def test_tokenizer_encode_decode_roundtrip():
@@ -34,15 +34,48 @@ def test_transformer_encoder_block():
 
 
 def test_vit_output_shape():
-    model = ViT(img_size=224, patch_size=16, n_embed=768, n_head=12, n_layers=2)
-    x = torch.randn(4, 3, 224, 224)
-    out = model(x)
-    assert out.shape == (4, 196, 768), f"Unexpected output shape: {out.shape}"
+    """Test output shapes for ViT, ViTContextEncoder, and ViTPredictor with default config."""
+    B, num_patches, n_embed = 4, 196, 768
 
+    # ViT: operates directly on patch token sequences
+    vit = ViT(n_embed=n_embed, n_head=12, n_layers=2)
+    x = torch.randn(B, num_patches, n_embed)
+    out = vit(x)
+    assert out.shape == (B, num_patches, n_embed), f"ViT unexpected shape: {out.shape}"
+
+    # ViTContextEncoder: encodes raw images into patch embeddings
+    context_encoder = ViTContextEncoder(img_size=224, patch_size=16, n_embed=n_embed, n_head=12, n_layers=2)
+    imgs = torch.randn(B, 3, 224, 224)
+    out = context_encoder(imgs)
+    assert out.shape == (B, num_patches, n_embed), f"ViTContextEncoder unexpected shape: {out.shape}"
+
+    # ViTPredictor: predicts target patches from context representations
+    predictor = ViTPredictor(num_patches=num_patches, n_embed=n_embed, n_head=12, n_layers=2)
+    target_indices = torch.zeros(B, num_patches, n_embed)
+    target_indices[:, :50, :] = 1.0
+    out = predictor(x, target_indices)
+    assert out.shape == (B, num_patches, n_embed), f"ViTPredictor unexpected shape: {out.shape}"
 
 
 def test_vit_single_channel():
-    model = ViT(img_size=224, patch_size=16, n_embed=768, n_head=12, n_layers=2, img_channels=1)
-    x = torch.randn(4, 1, 224, 224)
-    out = model(x)
-    assert out.shape == (4, 196, 768)
+    """Test ViT, ViTContextEncoder, and ViTPredictor with non-default configurations."""
+    B, num_patches, n_embed = 2, 49, 512
+
+    # ViT: smaller embedding dimension
+    vit = ViT(n_embed=n_embed, n_head=8, n_layers=2)
+    x = torch.randn(B, num_patches, n_embed)
+    out = vit(x)
+    assert out.shape == (B, num_patches, n_embed), f"ViT unexpected shape: {out.shape}"
+
+    # ViTContextEncoder: single-channel images with larger patch size
+    context_encoder = ViTContextEncoder(img_size=224, patch_size=32, n_embed=n_embed, n_head=8, n_layers=2, img_channels=1)
+    imgs = torch.randn(B, 1, 224, 224)
+    out = context_encoder(imgs)
+    assert out.shape == (B, num_patches, n_embed), f"ViTContextEncoder unexpected shape: {out.shape}"
+
+    # ViTPredictor: smaller embedding dimension
+    predictor = ViTPredictor(num_patches=num_patches, n_embed=n_embed, n_head=8, n_layers=2)
+    target_indices = torch.zeros(B, num_patches, n_embed)
+    target_indices[:, :10, :] = 1.0
+    out = predictor(x, target_indices)
+    assert out.shape == (B, num_patches, n_embed), f"ViTPredictor unexpected shape: {out.shape}"
