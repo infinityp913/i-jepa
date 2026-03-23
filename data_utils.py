@@ -223,19 +223,25 @@ def apply_masks(x, masks):
     )
 
 class ImageNetDataset(torch.utils.data.Dataset):
-    def __init__(self, hf_dataset, transform):
+    def __init__(self, hf_dataset, transform, patcher=None):
         self.hf_dataset = hf_dataset
         self.transform = transform
+        self.patcher = patcher
 
     def __len__(self):
         return len(self.hf_dataset)
 
     def __getitem__(self, idx):
         example = self.hf_dataset[idx]
-        return self.transform(example["image"].convert("RGB")), example["label"]
+        img = self.transform(example["image"].convert("RGB"))
+        return (
+            self.patcher(img.unsqueeze(0)).squeeze(0) if self.patcher else img,
+            example["label"]
+        )
 
 def make_imagenet(
     transform,
+    patcher=None,
     batch_size=1,
     dataset_name=None,
     local_name=None,
@@ -254,6 +260,7 @@ def make_imagenet(
 
     Args:
         transform     : torchvision transform to apply to each image.
+        patcher       : module to patch the image.
         batch_size    : per-GPU batch size.
         dataset_name  : Hugging Face dataset identifier.
         local_name    : folder name inside ``datasets/`` for caching.
@@ -287,7 +294,11 @@ def make_imagenet(
         logger.info(f"Dataset downloaded and saved — {len(hf_dataset)} images ({dataset_name}, {split})")
 
     data_loader = torch.utils.data.DataLoader(
-        ImageNetDataset(hf_dataset, transform),
+        ImageNetDataset(
+            hf_dataset,
+            transform,
+            patcher
+        ),
         collate_fn=collator,
         shuffle=shuffle,
         batch_size=batch_size,
@@ -321,13 +332,14 @@ def main():
         dataset_name="timm/mini-imagenet", # only specify the first time to download
         local_name="mini-imagenet",
         transform=make_transforms(normalization=(0, 1)), # for visuslization, no normalization
+        patcher=tokenizer.encode,
         collator=collator,
         split="test"
     )
 
     for (images, labels), enc_masks, pred_masks in data_loader:
-        print(apply_masks(tokenizer.encode(images), enc_masks).shape)
-        print(apply_masks(tokenizer.encode(images), pred_masks).shape)
+        print(apply_masks(images, enc_masks).shape)
+        print(apply_masks(images, pred_masks).shape)
 
         masks_to_plot = []
         for i, mask in enumerate(enc_masks): masks_to_plot.append((f"enc {i}", mask[0]))
@@ -341,7 +353,7 @@ def main():
 
         for ax, (title, mask_indices) in zip(axes, masks_to_plot):
             overlay = _overlay_mask_on_image(
-                image=images[0],
+                image=tokenizer.decode(images)[0],
                 mask_indices=mask_indices,
                 patch_size=collator.patch_size,
                 grid_size=(collator.height, collator.width),
