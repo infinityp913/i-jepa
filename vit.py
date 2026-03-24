@@ -110,8 +110,6 @@ class Encoder(nn.Module):
 
         self.transformer_blocks = nn.Sequential(*[TransformerBlock(d_model, n_head) for _ in range(n_layers)])
 
-        self.norm = nn.LayerNorm(d_model)
-
     def forward(self, x, masks=None):
         """
         Forward pass of the Encoder.
@@ -124,7 +122,6 @@ class Encoder(nn.Module):
         """
         x = self.embed(x) + self.positional_embedding[masks]   # positional emb for kept positions only
         x = self.transformer_blocks(x)
-        x = self.norm(x)
         return x
 
 class Predictor(nn.Module):
@@ -152,11 +149,9 @@ class Predictor(nn.Module):
 
         self.transformer_blocks = nn.Sequential(*[TransformerBlock(d_model, n_head) for _ in range(n_layers)])
 
-        self.ln1 = nn.LayerNorm(d_model)
+        self.norm = nn.LayerNorm(d_model)
 
         self.proj = nn.Linear(d_model, embed_dim)
-
-        self.ln2 = nn.LayerNorm(embed_dim)
 
     def forward(self, x, x_masks, y_masks):
         """
@@ -179,7 +174,5 @@ class Predictor(nn.Module):
         y = self.transformer_blocks(torch.cat([x, y], dim=1))[:, x_masks.shape[1]:]
 
         # project back to original embedding dimension
-        y = self.proj(self.ln1(y))
-
-        y = self.ln2(y)
+        y = self.proj(self.norm(y))
         return y
