@@ -322,7 +322,7 @@ def _overlay_mask_on_image(image, mask_indices, patch_size, grid_size, darken=0.
     return image * mask_pixels * darken
 
 def main():
-    from vit import Tokenizer
+    from models import Tokenizer
     import matplotlib.pyplot as plt
 
     tokenizer = Tokenizer(img_size=224, patch_size=16)
