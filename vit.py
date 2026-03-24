@@ -98,7 +98,7 @@ class Encoder(nn.Module):
             num_patches (int): Number of patches.
             patch_size (int): Square patch size (paper default: 16).
             img_channels (int): Number of input image channels (default: 3 for RGB).
-            d_model (int): Embedding dimension (paper default: 768).
+            d_model (int): Encoder dimensions (paper default: 768).
             n_head (int): Number of attention heads (paper default: 12).
             n_layers (int): Number of Transformer encoder blocks (paper default: 12).
         """
@@ -136,8 +136,8 @@ class Predictor(nn.Module):
 
         Args:
             num_patches (int): Number of patches.
-            embed_dim (int): Embedding dimension (paper default: 768).
-            d_model (int): Embedding dimension (paper default: 768).
+            embed_dim (int): Encoder dimension (paper default: 768).
+            d_model (int): Predictor dimension (paper default: 768).
             n_head (int): Number of attention heads.
             n_layers (int): Number of Transformer blocks (paper uses a narrower/shallower predictor).
         """
@@ -179,8 +179,7 @@ class Predictor(nn.Module):
         y = self.transformer_blocks(torch.cat([x, y], dim=1))[:, x_masks.shape[1]:]
 
         # project back to original embedding dimension
-        y = self.ln1(y)
-        y = self.proj(y)
+        y = self.proj(self.ln1(y))
 
         y = self.ln2(y)
         return y
