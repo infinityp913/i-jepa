@@ -196,14 +196,14 @@ class MaskCollator:
         # truncate to min kept across the batch so tensors are stackable
         return (
             torch.utils.data.default_collate(batch), 
-            torch.utils.data.default_collate([
+            torch.stack(torch.utils.data.default_collate([
                 [cm[:min_keep_enc] for cm in cm_list] 
                 for cm_list in collated_masks_enc
-            ]), 
-            torch.utils.data.default_collate([
+            ])), 
+            torch.stack(torch.utils.data.default_collate([
                 [cm[:min_keep_pred] for cm in cm_list] 
                 for cm_list in collated_masks_pred
-            ])
+            ]))
         )
 
 def apply_masks(x, masks):
