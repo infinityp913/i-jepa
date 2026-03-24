@@ -110,6 +110,8 @@ class Encoder(nn.Module):
 
         self.transformer_blocks = nn.Sequential(*[TransformerBlock(d_model, n_head) for _ in range(n_layers)])
 
+        self.norm = nn.LayerNorm(d_model)
+
     def forward(self, x, masks=None):
         """
         Forward pass of the Encoder.
@@ -122,6 +124,7 @@ class Encoder(nn.Module):
         """
         x = self.embed(x) + self.positional_embedding[masks]   # positional emb for kept positions only
         x = self.transformer_blocks(x)
+        x = self.norm(x)
         return x
 
 class Predictor(nn.Module):
@@ -176,3 +179,34 @@ class Predictor(nn.Module):
         # project back to original embedding dimension
         y = self.proj(self.norm(y))
         return y
+
+class ViT(nn.Module):
+    """A Vision Transformer model for classification."""
+
+    def __init__(self, num_patches, num_classes, patch_size=16, img_channels=3, d_model=768, n_head=12, n_layers=12):
+        """
+        Initializes the ViT.
+
+        Args:
+            num_patches (int): Number of patches.
+            num_classes (int): Number of classes.
+            patch_size (int): Patch size.
+            img_channels (int): Number of input image channels.
+            d_model (int): Encoder dimension.
+            n_head (int): Number of attention heads.
+            n_layers (int): Number of Transformer encoder blocks.
+            patch_size (int): Patch size.
+            num_classes (int): Number of classes.
+        """
+        super().__init__()
+        self.feature_extractor = Encoder(num_patches, patch_size, img_channels, d_model, n_head, n_layers)
+        
+        self.linear_head = nn.Linear(d_model, num_classes)
+
+    def forward(self, x):
+        """
+        Forward pass of the ViT.
+        """
+        x = self.feature_extractor(x)
+        x = self.linear_head(x.mean(dim=1))
+        return x
