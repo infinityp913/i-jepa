@@ -139,7 +139,7 @@ class Encoder(nn.Module):
         self.patch_embedding = PatchEmbedding(patch_size, n_embed, img_channels)
         self.transformer_blocks = nn.Sequential(*[TransformerBlock(n_embed, n_head) for _ in range(n_layers)])
 
-    def forward(self, x, masks):
+    def forward(self, x, masks=None):
         """
         Forward pass of the Encoder.
 
