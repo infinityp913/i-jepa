@@ -38,21 +38,21 @@ class Tokenizer(nn.Module):
 class TransformerBlock(nn.Module):
     """A standard Transformer block for vision tokens."""
 
-    def __init__(self, n_embed, n_head):
+    def __init__(self, d_model, n_head):
         """
         Args:
-            n_embed: The dimensionality of the embedding space.
+            d_model: The dimensionality of the embedding space.
             n_head: The number of attention heads.
         """
         super().__init__()
 
-        self.ln1 = nn.LayerNorm(n_embed)
-        self.mha = nn.MultiheadAttention(n_embed, n_head, batch_first=True)
-        self.ln2 = nn.LayerNorm(n_embed)
+        self.ln1 = nn.LayerNorm(d_model)
+        self.mha = nn.MultiheadAttention(d_model, n_head, batch_first=True)
+        self.ln2 = nn.LayerNorm(d_model)
         self.ffn = nn.Sequential(
-            nn.Linear(n_embed, n_embed * 4),
+            nn.Linear(d_model, d_model * 4),
             nn.GELU(), # The ViT paper uses GELU activation function
-            nn.Linear(n_embed * 4, n_embed),
+            nn.Linear(d_model * 4, d_model),
         )
 
     def forward(self, x):
