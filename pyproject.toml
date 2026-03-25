@@ -1,9 +1,11 @@
 [project]
 name = "i-jepa"
 version = "0.1.0"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = [
     "torch>=2.0",
+    "datasets==4.4.0",
+    "torchvision==0.24.1",
 ]
 
 [project.optional-dependencies]
