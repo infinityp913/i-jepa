@@ -1,34 +1,15 @@
 import torch
 from torch import nn
 
-
-class Transpose(nn.Module):
-    """A simple module to transpose two tensor dimensions."""
-
-    def __init__(self, d_1, d_2):
-        super().__init__()
-
-        self.dims = (d_1, d_2)
-
-    def forward(self, x):
-        return x.transpose(*self.dims)
-
-
 class Tokenizer(nn.Module):
     """ A module to tokenize an image into patches and reconstruct it back. """
 
     def __init__(self, img_size, patch_size):
         super().__init__()
 
-        self.unfold = nn.Sequential(
-            nn.Unfold(kernel_size=patch_size, stride=patch_size),
-            Transpose(1, 2),
-        )
+        self.unfold = nn.Unfold(kernel_size=patch_size, stride=patch_size)
 
-        self.fold = nn.Sequential(
-            Transpose(1, 2), 
-            nn.Fold(img_size, kernel_size=patch_size, stride=patch_size)
-        )
+        self.fold = nn.Fold(img_size, kernel_size=patch_size, stride=patch_size)
     
     def encode(self, x):
         """
@@ -40,7 +21,7 @@ class Tokenizer(nn.Module):
         Returns:
             torch.Tensor: Output tensor of shape (batch_size, num_patches, patch_size * patch_size * channels).
         """
-        return self.unfold(x)
+        return self.unfold(x).transpose(-2, -1)
     
     def decode(self, x):
         """
@@ -52,7 +33,7 @@ class Tokenizer(nn.Module):
         Returns:
             torch.Tensor: Output tensor of shape (batch_size, channels, height, width).
         """
-        return self.fold(x)
+        return self.fold(x.transpose(-2, -1))
 
 class TransformerBlock(nn.Module):
     """A standard Transformer block for vision tokens."""
