@@ -162,7 +162,8 @@ class Predictor(nn.Module):
         # concatenate context and target tokens, run through transformer, slice out target predictions
         y = self.transformer_blocks(torch.cat([x, y], dim=1))[:, n_ctx:]
 
-        # project back to original context encoder dimension
+        # project back to original context 
+        # encoder dimension
         y = self.proj(self.norm(y))
         return y
 
