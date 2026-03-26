@@ -114,19 +114,19 @@ class Encoder(nn.Module):
 class Predictor(nn.Module):
     """A Transformer based predictor for predicting the masked patches."""
 
-    def __init__(self, num_patches, embed_dim=768, d_model=768, n_head=12, n_layers=6):
+    def __init__(self, num_patches, encoder_dim=768, d_model=768, n_head=12, n_layers=6):
         """
         Initializes the Predictor.
 
         Args:
             num_patches (int): Number of patches.
-            embed_dim (int): Encoder dimension (paper default: 768).
+            encoder_dim (int): Encoder dimension (paper default: 768).
             d_model (int): Predictor dimension (paper default: 768).
             n_head (int): Number of attention heads.
             n_layers (int): Number of Transformer blocks (paper uses a narrower/shallower predictor).
         """
         super().__init__()
-        self.embed = nn.Linear(embed_dim, d_model)
+        self.embed = nn.Linear(encoder_dim, d_model)
 
         self.mask_token = nn.Parameter(torch.zeros(d_model))
         nn.init.trunc_normal_(self.mask_token, std=0.02)
@@ -138,7 +138,7 @@ class Predictor(nn.Module):
 
         self.norm = nn.LayerNorm(d_model)
 
-        self.proj = nn.Linear(d_model, embed_dim)
+        self.proj = nn.Linear(d_model, encoder_dim)
 
     def forward(self, x, x_masks, y_masks):
         """
