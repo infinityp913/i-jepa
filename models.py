@@ -106,7 +106,8 @@ class Encoder(nn.Module):
         Returns:
             torch.Tensor: Embeddings of kept patches [B, n_keep, n_embed].
         """
-        x = self.embed(x) + self.positional_embedding[context_indices]   # positional emb for kept positions only
+        pos = self.positional_embedding if context_indices is None else self.positional_embedding[context_indices]
+        x = self.embed(x) + pos
         x = self.transformer_blocks(x)
         x = self.norm(x)
         return x
@@ -114,15 +115,15 @@ class Encoder(nn.Module):
 class Predictor(nn.Module):
     """A Transformer based predictor for predicting the masked patches."""
 
-    def __init__(self, num_patches, encoder_dim=768, d_model=768, n_head=12, n_layers=6):
+    def __init__(self, num_patches, encoder_dim=768, d_model=384, n_head=6, n_layers=6):
         """
         Initializes the Predictor.
 
         Args:
             num_patches (int): Number of patches.
             encoder_dim (int): Encoder dimension (paper default: 768).
-            d_model (int): Predictor dimension (paper default: 768).
-            n_head (int): Number of attention heads.
+            d_model (int): Predictor dimension (paper default: 384 — narrower than encoder).
+            n_head (int): Number of attention heads (paper default: 6).
             n_layers (int): Number of Transformer blocks (paper uses a narrower/shallower predictor).
         """
         super().__init__()
@@ -152,15 +153,16 @@ class Predictor(nn.Module):
             torch.Tensor: Predicted embeddings at target positions [B, n_target, n_embed].
         """
         # embed the context tokens and add positional encoding for kept positions
+        n_ctx = x_masks.shape[1]
         x = self.embed(x) + self.positional_embedding[x_masks]
 
         # build mask tokens and add positional encoding for target positions
-        y = self.mask_token.expand(*y_masks.shape, -1) + self.positional_embedding[y_masks]
+        y = self.mask_token[None, None, :].expand(*y_masks.shape, -1) + self.positional_embedding[y_masks]
 
-        # return only the predictions for the target positions after passing context and target contatenated in the sequence dimension through the transformer blocks
-        y = self.transformer_blocks(torch.cat([x, y], dim=1))[:, x_masks.shape[1]:]
+        # concatenate context and target tokens, run through transformer, slice out target predictions
+        y = self.transformer_blocks(torch.cat([x, y], dim=1))[:, n_ctx:]
 
-        # project back to original embedding dimension
+        # project back to original context encoder dimension
         y = self.proj(self.norm(y))
         return y
 
@@ -179,8 +181,6 @@ class ViT(nn.Module):
             d_model (int): Encoder dimension.
             n_head (int): Number of attention heads.
             n_layers (int): Number of Transformer encoder blocks.
-            patch_size (int): Patch size.
-            num_classes (int): Number of classes.
         """
         super().__init__()
         self.feature_extractor = Encoder(num_patches, patch_size, img_channels, d_model, n_head, n_layers)
