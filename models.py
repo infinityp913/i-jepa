@@ -93,17 +93,17 @@ class Encoder(nn.Module):
 
         self.norm = nn.LayerNorm(d_model)
 
-    def forward(self, x, masks=None):
+    def forward(self, x, context_indices=None):
         """
         Forward pass of the Encoder.
 
         Args:
             x (torch.Tensor): Kept patches [B, n_keep, patch_size**2 * img_channels].
-            masks (torch.Tensor): Patch indices to keep [B, n_keep].
+            context_indices (torch.Tensor): Patch indices to keep [B, n_keep].
         Returns:
             torch.Tensor: Embeddings of kept patches [B, n_keep, n_embed].
         """
-        x = self.embed(x) + self.positional_embedding[masks]   # positional emb for kept positions only
+        x = self.embed(x) + self.positional_embedding[context_indices]   # positional emb for kept positions only
         x = self.transformer_blocks(x)
         x = self.norm(x)
         return x
@@ -143,12 +143,12 @@ class Predictor(nn.Module):
 
         Args:
             x (torch.Tensor):             Context encoder outputs [B, n_keep_enc, n_embed].
-            x_masks (torch.Tensor): Patch indices kept by the encoder [B, n_keep_enc].
+            x_masks (torch.Tensor): Patch indices kept as context by context encoder [B, n_keep_enc].
             y_masks (torch.Tensor):  Patch indices to predict [B, n_keep_pred].
         Returns:
             torch.Tensor: Predicted embeddings at target positions [B, n_keep_pred, n_embed].
         """
-        # add positional encoding to context tokens
+        # embed the context tokens and add positional encoding for kept positions
         x = self.embed(x) + self.positional_embedding[x_masks]
 
         # build mask tokens and add positional encoding for target positions
