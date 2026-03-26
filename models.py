@@ -61,6 +61,9 @@ class TransformerBlock(nn.Module):
 
         Args:
             x (torch.Tensor): Input tensor of shape (batch_size, seq_len, n_embed).
+
+        Returns:
+            torch.Tensor: Output tensor of the same shape as input (batch_size, seq_len, n_embed).
         """
         normed_x = self.ln1(x)
         x = x + self.mha(normed_x, normed_x, normed_x, need_weights=False)[0] # need_weights=False uses the optimized scaled_dot_product_attention
@@ -154,7 +157,7 @@ class Predictor(nn.Module):
         # build mask tokens and add positional encoding for target positions
         y = self.mask_token.expand(*y_masks.shape, -1) + self.positional_embedding[y_masks]
 
-        # return only the predictions for the target positions
+        # return only the predictions for the target positions after passing context and target contatenated in the sequence dimension through the transformer blocks
         y = self.transformer_blocks(torch.cat([x, y], dim=1))[:, x_masks.shape[1]:]
 
         # project back to original embedding dimension
