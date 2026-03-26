@@ -144,9 +144,9 @@ class Predictor(nn.Module):
         Args:
             x (torch.Tensor):             Context encoder outputs [B, n_keep_enc, n_embed].
             x_masks (torch.Tensor): Patch indices kept as context by context encoder [B, n_keep_enc].
-            y_masks (torch.Tensor):  Patch indices to predict [B, n_keep_pred].
+            y_masks (torch.Tensor):  Patch indices to predict [B, n_target].
         Returns:
-            torch.Tensor: Predicted embeddings at target positions [B, n_keep_pred, n_embed].
+            torch.Tensor: Predicted embeddings at target positions [B, n_target, n_embed].
         """
         # embed the context tokens and add positional encoding for kept positions
         x = self.embed(x) + self.positional_embedding[x_masks]
