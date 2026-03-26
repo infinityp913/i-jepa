@@ -355,8 +355,8 @@ def main() -> None:
         print(apply_masks(images, pred_masks).shape)
 
         masks_to_plot = []
-        for i, mask in enumerate(enc_masks): masks_to_plot.append((f"enc {i}", mask[0]))
-        for i, mask in enumerate(pred_masks): masks_to_plot.append((f"pred {i}", mask[0]))
+        for i, mask in enumerate(enc_masks): masks_to_plot.append((f"context block {i}", mask[0]))
+        for i, mask in enumerate(pred_masks): masks_to_plot.append((f"target block {i}", mask[0]))
 
         total = len(masks_to_plot)
         cols = min(total, 5)

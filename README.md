@@ -60,6 +60,22 @@ uv run --extra dev pytest tests/ -v
 
 ---
 
+## Visualizing context and target blocks
+
+`data_utils.py` has a `main()` that downloads mini-ImageNet, runs the `MaskCollator`, and plots each batch with the context and target blocks overlaid on the image.
+
+```bash
+uv run python data_utils.py
+```
+
+On first run, the dataset (~200 MB) is downloaded from Hugging Face and cached under `datasets/mini-imagenet/`. Subsequent runs load from disk instantly.
+
+Each plot shows one image per batch with panels labelled **context block 0** (the visible region fed to the encoder) and **target block 0–3** (the masked regions the predictor must reconstruct in representation space).
+
+> The `datasets/` directory is gitignored — each contributor downloads their own copy on first run.
+
+---
+
 ## Usage
 
 ```python
