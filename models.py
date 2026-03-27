@@ -96,17 +96,17 @@ class Encoder(nn.Module):
 
         self.norm = nn.LayerNorm(d_model)
 
-    def forward(self, x, context_indices=None):
+    def forward(self, x, masks=None):
         """
         Forward pass of the Encoder.
 
         Args:
             x (torch.Tensor): Kept patches [B, n_keep, patch_size**2 * img_channels].
-            context_indices (torch.Tensor): Patch indices to keep [B, n_keep].
+            masks (torch.Tensor): Patch indices to keep [B, n_keep].
         Returns:
             torch.Tensor: Embeddings of kept patches [B, n_keep, n_embed].
         """
-        pos = self.positional_embedding if context_indices is None else self.positional_embedding[context_indices]
+        pos = self.positional_embedding if masks is None else self.positional_embedding[masks]
         x = self.embed(x) + pos
         x = self.transformer_blocks(x)
         x = self.norm(x)
