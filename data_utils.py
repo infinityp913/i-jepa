@@ -261,7 +261,7 @@ def make_imagenet(
     collator: Optional[Callable] = None,
     pin_mem: bool = True,
     shuffle: bool = True,
-    num_workers: Optional[int] = os.cpu_count(),
+    num_workers: int = os.cpu_count() or 1,
     split: str = "train",
     drop_last: bool = True,
 ) -> torch.utils.data.DataLoader:
@@ -318,7 +318,7 @@ def make_imagenet(
         drop_last=drop_last,
         pin_memory=pin_mem,
         num_workers=num_workers,
-        persistent_workers=(num_workers is not None and num_workers > 0),
+        persistent_workers=(num_workers > 0),
     )
     
     logger.info("DataLoader created")
