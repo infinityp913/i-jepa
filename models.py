@@ -152,14 +152,13 @@ class Predictor(nn.Module):
             torch.Tensor: Predicted embeddings at target positions [B, n_target, n_embed].
         """
         # embed the context tokens and add positional encoding for kept positions
-        n_ctx = x_masks.shape[1]
         x = self.embed(x) + self.positional_embedding[x_masks]
 
         # build mask tokens and add positional encoding for target positions
         y = self.mask_token[None, None, :].expand(*y_masks.shape, -1) + self.positional_embedding[y_masks]
 
         # concatenate context and target tokens, run through transformer, slice out target predictions
-        y = self.transformer_blocks(torch.cat([x, y], dim=1))[:, n_ctx:]
+        y = self.transformer_blocks(torch.cat([x, y], dim=1))[:, x_masks.shape[1]:]
 
         # project back to original context 
         # encoder dimension
