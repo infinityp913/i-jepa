@@ -42,8 +42,8 @@ class MaskCollator:
 
     Returns:
         collated_images : Tensor  [B, C, H, W]
-        enc_masks       : list of Tensor  (nenc tensors, each [B, n_keep_enc])
-        pred_masks      : list of Tensor  (npred tensors, each [B, n_keep_pred])
+        enc_masks       : list of Tensor  (nenc tensors, each [B, n_ctx])
+        pred_masks      : list of Tensor  (npred tensors, each [B, n_target])
 
     Mask tensors contain *patch indices* (into the flattened H×W grid) that
     should be kept / predicted.
@@ -166,8 +166,8 @@ class MaskCollator:
 
         Returns:
             collated_batch  : Tensor [B, C, H, W]
-            collated_enc    : list[Tensor]  length nenc, each [B, min_keep_enc]
-            collated_pred   : list[Tensor]  length npred, each [B, min_keep_pred]
+            collated_enc    : list[Tensor]  length nenc, each [B, min_ctx]
+            collated_pred   : list[Tensor]  length npred, each [B, min_target]
         """
         # -- shared per-batch seed for block *sizes*
         g = torch.Generator()
@@ -185,7 +185,7 @@ class MaskCollator:
         )
 
         collated_masks_pred, collated_masks_enc = [], []
-        min_keep_enc = min_keep_pred = self.height * self.width
+        min_ctx = min_target = self.height * self.width
 
         for _ in range(len(batch)):
             # predictor (target) masks
@@ -194,7 +194,7 @@ class MaskCollator:
                 mask, mask_C = self._sample_block_mask(p_size)
                 masks_p.append(mask)
                 masks_C.append(mask_C)
-                min_keep_pred = min(min_keep_pred, len(mask))
+                min_target = min(min_target, len(mask))
             collated_masks_pred.append(masks_p)
 
             # encoder (context) masks — no overlap with predictor blocks
@@ -203,18 +203,18 @@ class MaskCollator:
             for _ in range(self.nenc):
                 mask = self._sample_block_mask(e_size, acceptable_regions=acceptable_regions)[0]
                 masks_e.append(mask)
-                min_keep_enc = min(min_keep_enc, len(mask))
+                min_ctx = min(min_ctx, len(mask))
             collated_masks_enc.append(masks_e)
 
         # truncate to min kept across the batch so tensors are stackable
         return (
             torch.utils.data.default_collate(batch), 
             torch.stack(torch.utils.data.default_collate([
-                [cm[:min_keep_enc] for cm in cm_list] 
+                [cm[:min_ctx] for cm in cm_list] 
                 for cm_list in collated_masks_enc
             ])), 
             torch.stack(torch.utils.data.default_collate([
-                [cm[:min_keep_pred] for cm in cm_list] 
+                [cm[:min_target] for cm in cm_list] 
                 for cm_list in collated_masks_pred
             ]))
         )

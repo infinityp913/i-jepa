@@ -28,12 +28,12 @@ def test_encoder_all_patches():
 
 
 def test_encoder_with_masks():
-    num_patches, n_keep = 196, 100
+    num_patches, n_ctx = 196, 100
     encoder = Encoder(num_patches=num_patches, patch_size=16, img_channels=3, d_model=768, n_head=12, n_layers=2)
-    x = torch.randn(4, n_keep, 16 * 16 * 3)
-    masks = torch.stack([torch.randperm(num_patches)[:n_keep] for _ in range(4)])
+    x = torch.randn(4, n_ctx, 16 * 16 * 3)
+    masks = torch.stack([torch.randperm(num_patches)[:n_ctx] for _ in range(4)])
     out = encoder(x, masks)
-    assert out.shape == (4, n_keep, 768), f"Unexpected shape: {out.shape}"
+    assert out.shape == (4, n_ctx, 768), f"Unexpected shape: {out.shape}"
 
 
 def test_vit_output_shape():

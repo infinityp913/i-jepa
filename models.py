@@ -101,10 +101,10 @@ class Encoder(nn.Module):
         Forward pass of the Encoder.
 
         Args:
-            x (torch.Tensor): Kept patches [B, n_keep, patch_size**2 * img_channels].
-            masks (torch.Tensor): Patch indices to keep [B, n_keep]. Pass None to use all context patches.
+            x (torch.Tensor): Kept patches [B, n_ctx, patch_size**2 * img_channels].
+            masks (torch.Tensor): Patch indices to keep [B, n_ctx]. Pass None to use all context patches.
         Returns:
-            torch.Tensor: Embeddings of kept patches [B, n_keep, n_embed].
+            torch.Tensor: Embeddings of kept patches [B, n_ctx, n_embed].
         """
         x = self.embed(x) + self.positional_embedding[masks]
         x = self.transformer_blocks(x)
@@ -145,8 +145,8 @@ class Predictor(nn.Module):
         Forward pass of the Predictor.
 
         Args:
-            x (torch.Tensor):             Context encoder outputs [B, n_keep_enc, n_embed].
-            x_masks (torch.Tensor): Patch indices kept as context by context encoder [B, n_keep_enc].
+            x (torch.Tensor):             Context encoder outputs [B, n_ctx, n_embed].
+            x_masks (torch.Tensor): Patch indices kept as context by context encoder [B, n_ctx].
             y_masks (torch.Tensor):  Patch indices to predict [B, n_target].
         Returns:
             torch.Tensor: Predicted embeddings at target positions [B, n_target, n_embed].
