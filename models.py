@@ -102,12 +102,11 @@ class Encoder(nn.Module):
 
         Args:
             x (torch.Tensor): Kept patches [B, n_keep, patch_size**2 * img_channels].
-            masks (torch.Tensor): Patch indices to keep [B, n_keep].
+            masks (torch.Tensor): Patch indices to keep [B, n_keep]. Pass None to use all context patches.
         Returns:
             torch.Tensor: Embeddings of kept patches [B, n_keep, n_embed].
         """
-        pos = self.positional_embedding if masks is None else self.positional_embedding[masks]
-        x = self.embed(x) + pos
+        x = self.embed(x) + self.positional_embedding[masks]
         x = self.transformer_blocks(x)
         x = self.norm(x)
         return x
