@@ -134,7 +134,7 @@ class Predictor(nn.Module):
         super().__init__()
         self.embed = nn.Linear(embed_dim, d_model)
 
-        self.mask_token = nn.Parameter(torch.randn(embed_dim))
+        self.mask_token = nn.Parameter(torch.randn(d_model))
         nn.init.trunc_normal_(self.mask_token, std=0.02)
 
         self.positional_embedding = nn.Parameter(torch.randn(num_patches, d_model))
