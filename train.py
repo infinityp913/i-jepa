@@ -2,6 +2,11 @@ import torch
 import models
 import data_utils as utils
 import matplotlib.pyplot as plt
+import logging
+from tqdm import tqdm
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
 
 #number of target blocks
 npred = 4
@@ -47,8 +52,9 @@ loss_history = []
 
 
 for epoch in range(epochs):
-    print("epoch: ", epoch, "/", epochs, sep="")
-    for (images, labels), enc_masks, pred_masks in data_loader_train:
+    logger.info(f"Epoch {epoch + 1}/{epochs}")
+    pbar = tqdm(data_loader_train, desc=f"Epoch {epoch + 1}/{epochs}")
+    for (images, labels), enc_masks, pred_masks in pbar:
         
 
         enc_masks = enc_masks.flatten(start_dim=0, end_dim=1)
@@ -73,6 +79,7 @@ for epoch in range(epochs):
         loss = loss_fn(predicted_target_embeddings, actual_target_embeddings)
 
         loss_history.append(loss.item())
+        pbar.set_postfix(loss=f"{loss.item():.4f}")
 
         #backprop
         loss.backward()
