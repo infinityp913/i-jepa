@@ -2,6 +2,7 @@ import math
 import logging
 from multiprocessing import Value
 import os
+from typing import Callable, Optional, Union
 import torch
 import torchvision.transforms as transforms
 from datasets import load_dataset, load_from_disk
@@ -12,11 +13,13 @@ _DATASETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "datase
 
 
 def make_transforms(
-    crop_size=224,
-    crop_scale=(0.3, 1.0),
-    normalization=((0.485, 0.456, 0.406),
-                   (0.229, 0.224, 0.225)),
-):
+    crop_size: int = 224,
+    crop_scale: tuple[float, float] = (0.3, 1.0),
+    normalization: tuple[tuple[float, float, float], tuple[float, float, float]] = (
+        (0.485, 0.456, 0.406),
+        (0.229, 0.224, 0.225),
+    ),
+) -> transforms.Compose:
     """
     Build the pre-training image transform for I-JEPA.
 
@@ -39,8 +42,8 @@ class MaskCollator:
 
     Returns:
         collated_images : Tensor  [B, C, H, W]
-        enc_masks       : list of Tensor  (nenc tensors, each [B, n_keep_enc])
-        pred_masks      : list of Tensor  (npred tensors, each [B, n_keep_pred])
+        enc_masks       : list of Tensor  (nenc tensors, each [B, n_ctx])
+        pred_masks      : list of Tensor  (npred tensors, each [B, n_target])
 
     Mask tensors contain *patch indices* (into the flattened H×W grid) that
     should be kept / predicted.
@@ -48,16 +51,16 @@ class MaskCollator:
 
     def __init__(
         self,
-        input_size=(224, 224),
-        patch_size=16,
-        enc_mask_scale=(0.85, 1.0),
-        pred_mask_scale=(0.15, 0.2),
-        aspect_ratio=(0.75, 1.5),
-        nenc=1,
-        npred=4,
-        min_keep=4,
-        allow_overlap=False,
-    ):
+        input_size: Union[tuple[int, int], int] = (224, 224),
+        patch_size: int = 16,
+        enc_mask_scale: tuple[float, float] = (0.85, 1.0),
+        pred_mask_scale: tuple[float, float] = (0.15, 0.2),
+        aspect_ratio: tuple[float, float] = (0.75, 1.5),
+        nenc: int = 1,
+        npred: int = 4,
+        min_keep: int = 4,
+        allow_overlap: bool = False,
+    ) -> None:
         if not isinstance(input_size, tuple): input_size = (input_size,) * 2
         self.patch_size = patch_size
         self.height = input_size[0] // patch_size
@@ -71,7 +74,7 @@ class MaskCollator:
         self.allow_overlap = allow_overlap
         self._itr_counter = Value("i", -1)
 
-    def step(self):
+    def step(self) -> int:
         """Atomically increment the iteration counter and return the value."""
         i = self._itr_counter
         with i.get_lock():
@@ -80,8 +83,18 @@ class MaskCollator:
         
         return v
 
-    def _sample_block_size(self, generator, scale, aspect_ratio_scale):
-        """Sample a block (h, w) in *patch* units from scale and AR ranges."""
+    def _sample_block_size(self, generator : torch.Generator, scale : tuple[float, float], aspect_ratio_scale : tuple[float, float]) -> tuple[int, int]:
+        """
+        Sample a block (h, w) in *patch* units from scale and AR ranges.
+        
+        Args:
+            generator: torch.Generator for reproducibility.
+            scale: tuple (min, max) block size as a fraction of total patches.
+            aspect_ratio_scale: tuple (min, max) aspect ratio of the block.
+
+        Returns:
+            block_size: tuple (h, w) in patch units.
+        """
         _rand = torch.rand(1, generator=generator).item()
 
         # block scale → number of patches
@@ -98,7 +111,7 @@ class MaskCollator:
             min(int(round(math.sqrt(max_keep / aspect_ratio))), self.width)
         )
 
-    def _sample_block_mask(self, block_size, acceptable_regions=[], tries=20):
+    def _sample_block_mask(self, block_size: tuple[int, int], acceptable_regions: list[torch.Tensor] = [], tries: int = 20) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Sample a rectangular block at a random position on the patch grid.
 
@@ -137,7 +150,7 @@ class MaskCollator:
 
         return mask_indices, mask_complement
 
-    def __call__(self, batch):
+    def __call__(self, batch: list) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Collate a list of (image, label) tuples into a batch *and* generate
         encoder / predictor masks.
@@ -153,8 +166,8 @@ class MaskCollator:
 
         Returns:
             collated_batch  : Tensor [B, C, H, W]
-            collated_enc    : list[Tensor]  length nenc, each [B, min_keep_enc]
-            collated_pred   : list[Tensor]  length npred, each [B, min_keep_pred]
+            collated_enc    : list[Tensor]  length nenc, each [B, min_ctx]
+            collated_pred   : list[Tensor]  length npred, each [B, min_target]
         """
         # -- shared per-batch seed for block *sizes*
         g = torch.Generator()
@@ -172,7 +185,7 @@ class MaskCollator:
         )
 
         collated_masks_pred, collated_masks_enc = [], []
-        min_keep_enc = min_keep_pred = self.height * self.width
+        min_ctx = min_target = self.height * self.width
 
         for _ in range(len(batch)):
             # predictor (target) masks
@@ -181,7 +194,7 @@ class MaskCollator:
                 mask, mask_C = self._sample_block_mask(p_size)
                 masks_p.append(mask)
                 masks_C.append(mask_C)
-                min_keep_pred = min(min_keep_pred, len(mask))
+                min_target = min(min_target, len(mask))
             collated_masks_pred.append(masks_p)
 
             # encoder (context) masks — no overlap with predictor blocks
@@ -190,23 +203,23 @@ class MaskCollator:
             for _ in range(self.nenc):
                 mask = self._sample_block_mask(e_size, acceptable_regions=acceptable_regions)[0]
                 masks_e.append(mask)
-                min_keep_enc = min(min_keep_enc, len(mask))
+                min_ctx = min(min_ctx, len(mask))
             collated_masks_enc.append(masks_e)
 
         # truncate to min kept across the batch so tensors are stackable
         return (
             torch.utils.data.default_collate(batch), 
             torch.stack(torch.utils.data.default_collate([
-                [cm[:min_keep_enc] for cm in cm_list] 
+                [cm[:min_ctx] for cm in cm_list] 
                 for cm_list in collated_masks_enc
             ])), 
             torch.stack(torch.utils.data.default_collate([
-                [cm[:min_keep_pred] for cm in cm_list] 
+                [cm[:min_target] for cm in cm_list] 
                 for cm_list in collated_masks_pred
             ]))
         )
 
-def apply_masks(x, masks):
+def apply_masks(x: torch.Tensor, masks: list[torch.Tensor]) -> torch.Tensor:
     """
     Select patch embeddings at the positions given by *masks*.
 
@@ -223,15 +236,15 @@ def apply_masks(x, masks):
     )
 
 class ImageNetDataset(torch.utils.data.Dataset):
-    def __init__(self, hf_dataset, transform, patcher=None):
+    def __init__(self, hf_dataset, transform: Callable, patcher: Optional[Callable] = None) -> None:
         self.hf_dataset = hf_dataset
         self.transform = transform
         self.patcher = patcher
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.hf_dataset)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, int]:
         example = self.hf_dataset[idx]
         img = self.transform(example["image"].convert("RGB"))
         return (
@@ -240,18 +253,18 @@ class ImageNetDataset(torch.utils.data.Dataset):
         )
 
 def make_imagenet(
-    transform,
-    patcher=None,
-    batch_size=1,
-    dataset_name=None,
-    local_name=None,
-    collator=None,
-    pin_mem=True,
-    shuffle=True,
-    num_workers=os.cpu_count(),
-    split="train",
-    drop_last=True,
-):
+    transform: Callable,
+    patcher: Optional[Callable] = None,
+    batch_size: int = 1,
+    dataset_name: Optional[str] = None,
+    local_name: Optional[str] = None,
+    collator: Optional[Callable] = None,
+    pin_mem: bool = True,
+    shuffle: bool = True,
+    num_workers: int = os.cpu_count() or 1,
+    split: str = "train",
+    drop_last: bool = True,
+) -> torch.utils.data.DataLoader:
     """
     Build a mini-ImageNet dataset and DataLoader from Hugging Face.
 
@@ -312,7 +325,7 @@ def make_imagenet(
 
     return data_loader
 
-def _overlay_mask_on_image(image, mask_indices, patch_size, grid_size, darken=0.65):
+def _overlay_mask_on_image(image: torch.Tensor, mask_indices: torch.Tensor, patch_size: int, grid_size: tuple[int, int], darken: float = 0.65) -> torch.Tensor:
     """Overlay a mask on an image, only for visualization."""
     grid_h, grid_w = grid_size
     mask_indices = mask_indices.flatten().to(torch.long)
@@ -321,7 +334,7 @@ def _overlay_mask_on_image(image, mask_indices, patch_size, grid_size, darken=0.
     mask_pixels = mask_grid.repeat_interleave(patch_size, dim=0).repeat_interleave(patch_size, dim=1)[: image.shape[1], : image.shape[2]]
     return image * mask_pixels * darken
 
-def main():
+def main() -> None:
     from models import Tokenizer
     import matplotlib.pyplot as plt
 
@@ -342,8 +355,8 @@ def main():
         print(apply_masks(images, pred_masks).shape)
 
         masks_to_plot = []
-        for i, mask in enumerate(enc_masks): masks_to_plot.append((f"enc {i}", mask[0]))
-        for i, mask in enumerate(pred_masks): masks_to_plot.append((f"pred {i}", mask[0]))
+        for i, mask in enumerate(enc_masks): masks_to_plot.append((f"context block {i}", mask[0]))
+        for i, mask in enumerate(pred_masks): masks_to_plot.append((f"target block {i}", mask[0]))
 
         total = len(masks_to_plot)
         cols = min(total, 5)

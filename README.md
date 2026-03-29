@@ -22,30 +22,57 @@ All components are implemented from scratch in PyTorch with no external vision l
 | Component | Description |
 |---|---|
 | `Tokenizer` | Splits images into non-overlapping patches using `nn.Unfold`; reconstructs with `nn.Fold` |
-| `PatchEmbedding` | Linear projection of flattened patches into embedding dimension |
-| `TransformerEncoderBlock` | Pre-norm transformer block with multi-head self-attention and GELU FFN |
-| `ViT` | Full Vision Transformer encoder — backbone for context and target encoders |
-| `Predictor` | *(coming soon)* Narrow transformer that maps context embeddings + mask tokens to target space |
+| `TransformerBlock` | Pre-norm transformer block with multi-head self-attention and GELU FFN |
+| `Encoder` | ViT encoder with learnable positional embeddings; supports masked (subset of patches) forward pass |
+| `Predictor` | Narrow transformer (384-dim) that maps context embeddings + mask tokens to target space |
+| `ViT` | Full Vision Transformer for classification — wraps `Encoder` with a linear head |
 | `IJEPA` | *(coming soon)* Full I-JEPA model with EMA target encoder and training logic |
 
 ---
 
 ## Installation
 
+Dependencies are managed with [uv](https://docs.astral.sh/uv/). The `uv.lock` file is committed to the repo to ensure a reproducible environment.
+
 ```bash
 git clone https://github.com/<your-username>/i-jepa.git
 cd i-jepa
-python3 -m venv .venv
+uv sync
+```
+
+This creates a `.venv` and installs all pinned dependencies from `uv.lock`. To activate the environment manually:
+
+```bash
 source .venv/bin/activate
-pip install -e ".[dev]"
+```
+
+Alternatively, prefix any command with `uv run` to use the venv without activating it:
+
+```bash
+uv run --extra dev pytest tests/ -v
 ```
 
 ## Running tests
 
 ```bash
-source .venv/bin/activate
-pytest tests/ -v
+uv run --extra dev pytest tests/ -v
 ```
+
+---
+
+## Visualizing context and target blocks
+
+`data_utils.py` has a `main()` that downloads mini-ImageNet, runs the `MaskCollator`, and plots each batch with the context and target blocks overlaid on the image.
+
+```bash
+uv run python data_utils.py
+```
+
+On first run, the dataset (~200 MB) is downloaded from Hugging Face and cached under `datasets/mini-imagenet/`. Subsequent runs load from disk instantly.
+
+Each plot shows one image per batch with panels labelled **context block 0** (the visible region fed to the encoder) and **target block 0–3** (the masked regions the predictor must reconstruct in representation space).
+
+> The `datasets/` directory is gitignored — each contributor downloads their own copy on first run.
 
 ---
 
@@ -53,18 +80,28 @@ pytest tests/ -v
 
 ```python
 import torch
-from vit import ViT
+from models import Tokenizer, Encoder, Predictor, ViT
 
-model = ViT(
-    img_size=224,
-    patch_size=16,
-    n_embed=768,
-    n_head=12,
-    n_layers=12,
-)
+patch_size, img_size, num_patches = 16, 224, 196
 
-x = torch.randn(4, 3, 224, 224)  # (batch, channels, H, W)
-embeddings = model(x)             # (4, 196, 768) — 196 patches of dim 768
+# Tokenize images into patches
+tokenizer = Tokenizer(img_size=img_size, patch_size=patch_size)
+images = torch.randn(4, 3, img_size, img_size)  # (B, C, H, W)
+patches = tokenizer.encode(images)               # (4, 196, 768) — 196 patches
+
+# Encode a subset of patches (context encoder)
+encoder = Encoder(num_patches=num_patches, patch_size=patch_size, d_model=768, n_head=12, n_layers=12)
+context_idx = torch.stack([torch.randperm(num_patches)[:100] for _ in range(4)])
+ctx_embeddings = encoder(patches[..., :context_idx.shape[1], :], context_idx)  # (4, 100, 768)
+
+# Predict target embeddings for masked positions
+predictor = Predictor(num_patches=num_patches, encoder_dim=768, d_model=384, n_head=6, n_layers=6)
+target_idx = torch.stack([torch.randperm(num_patches)[:20] for _ in range(4)])
+predictions = predictor(ctx_embeddings, context_idx, target_idx)  # (4, 20, 768)
+
+# ViT for classification (takes pre-tokenized patches)
+vit = ViT(num_patches=num_patches, num_classes=1000, patch_size=patch_size, n_head=12, n_layers=12)
+logits = vit(patches)  # (4, 1000)
 ```
 
 

@@ -61,6 +61,9 @@ class TransformerBlock(nn.Module):
 
         Args:
             x (torch.Tensor): Input tensor of shape (batch_size, seq_len, n_embed).
+
+        Returns:
+            torch.Tensor: Output tensor of the same shape as input (batch_size, seq_len, n_embed).
         """
         normed_x = self.ln1(x)
         x = x + self.mha(normed_x, normed_x, normed_x, need_weights=False)[0] # need_weights=False uses the optimized scaled_dot_product_attention
@@ -102,10 +105,10 @@ class Encoder(nn.Module):
         Forward pass of the Encoder.
 
         Args:
-            x (torch.Tensor): Kept patches [B, n_keep, patch_size**2 * img_channels].
-            masks (torch.Tensor): Patch indices to keep [B, n_keep].
+            x (torch.Tensor): Kept patches [B, n_context, patch_size**2 * img_channels].
+            masks (torch.Tensor): Patch indices to keep [B, n_context]. Pass None to use all context patches.
         Returns:
-            torch.Tensor: Embeddings of kept patches [B, n_keep, n_embed].
+            torch.Tensor: Embeddings of kept patches [B, n_context, n_embed].
         """
 
 
@@ -124,11 +127,12 @@ class Predictor(nn.Module):
         Args:
             num_patches (int): Number of patches.
             embed_dim (int): Encoder dimension (paper default: 768).
-            d_model (int): Predictor dimension (paper default: 768).
-            n_head (int): Number of attention heads.
+            d_model (int): Predictor dimension (paper default: 384 — narrower than encoder).
+            n_head (int): Number of attention heads (paper default: 6).
             n_layers (int): Number of Transformer blocks (paper uses a narrower/shallower predictor).
         """
         super().__init__()
+        self.embed = nn.Linear(embed_dim, d_model)
 
         self.mask_token = nn.Parameter(torch.randn(embed_dim))
         nn.init.trunc_normal_(self.mask_token, std=0.02)
@@ -143,32 +147,31 @@ class Predictor(nn.Module):
 
         self.norm = nn.LayerNorm(d_model)
 
-        self.proj_to_embed_dim = nn.Linear(d_model, embed_dim)
+        self.proj = nn.Linear(d_model, embed_dim)
 
     def forward(self, x, x_masks, y_masks):
         """
         Forward pass of the Predictor.
 
         Args:
-            x (torch.Tensor):             Context encoder outputs [B, n_keep_enc, n_embed].
-            x_masks (torch.Tensor): Patch indices kept by the encoder [B, n_keep_enc].
-            y_masks (torch.Tensor):  Patch indices to predict [B, n_keep_pred].
+            x (torch.Tensor):             Context encoder outputs [B, n_context, n_embed].
+            x_masks (torch.Tensor): Patch indices kept as context by context encoder [B, n_context].
+            y_masks (torch.Tensor):  Patch indices to predict [B, n_target].
         Returns:
-            torch.Tensor: Predicted embeddings at target positions [B, n_keep_pred, n_embed].
+            torch.Tensor: Predicted embeddings at target positions [B, n_target, n_embed].
         """
-
-        x = self.proj_to_d_model(x)
-        # add positional encoding to context tokens
-        x = x + self.positional_embedding[x_masks]
+        # embed the context tokens and add positional encoding for kept positions
+        x = self.embed(x) + self.positional_embedding[x_masks]
 
         # build mask tokens and add positional encoding for target positions
-        y = self.mask_token.expand(*y_masks.shape, -1) + self.positional_embedding[y_masks]
+        y = self.mask_token[None, None, :].expand(*y_masks.shape, -1) + self.positional_embedding[y_masks]
 
-        # return only the predictions for the target positions
+        # concatenate context and target tokens, run through transformer, slice out target predictions
         y = self.transformer_blocks(torch.cat([x, y], dim=1))[:, x_masks.shape[1]:]
 
-        # project back to original embedding dimension
-        y = self.proj_to_embed_dim(self.norm(y))
+        # project back to original context 
+        # encoder dimension
+        y = self.proj(self.norm(y))
         return y
 
 class ViT(nn.Module):
@@ -186,8 +189,6 @@ class ViT(nn.Module):
             d_model (int): Encoder dimension.
             n_head (int): Number of attention heads.
             n_layers (int): Number of Transformer encoder blocks.
-            patch_size (int): Patch size.
-            num_classes (int): Number of classes.
         """
         super().__init__()
         self.feature_extractor = Encoder(patch_size, img_channels, d_model, n_head, n_layers)
