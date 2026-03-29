@@ -32,7 +32,7 @@ epochs = 10
 
 #models
 context_encoder = models.Encoder()
-predictor = models.Predictor(context_encoder.positional_embedding)
+predictor = models.Predictor()
 target_encoder = models.Encoder(positional_embeddings=context_encoder.positional_embedding)
 
 #loss and optimizer

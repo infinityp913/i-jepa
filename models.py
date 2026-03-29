@@ -117,7 +117,7 @@ class Encoder(nn.Module):
 class Predictor(nn.Module):
     """A Transformer based predictor for predicting the masked patches."""
 
-    def __init__(self, positional_embeddings, embed_dim=768, d_model=384, n_head=12, n_layers=6):
+    def __init__(self, num_patches=196, embed_dim=768, d_model=384, n_head=12, n_layers=6):
         """
         Initializes the Predictor.
 
@@ -133,7 +133,9 @@ class Predictor(nn.Module):
         self.mask_token = nn.Parameter(torch.randn(embed_dim))
         nn.init.trunc_normal_(self.mask_token, std=0.02)
 
-        self.positional_embedding = positional_embeddings
+        self.positional_embedding = nn.Parameter(torch.randn(num_patches, d_model))
+        torch.nn.init.trunc_normal_(self.positional_embedding, std=0.02)  # Initialize positional embeddings with truncated normal distribution
+        
 
         self.proj_to_d_model = nn.Linear(embed_dim, d_model)
 
@@ -155,7 +157,7 @@ class Predictor(nn.Module):
             torch.Tensor: Predicted embeddings at target positions [B, n_keep_pred, n_embed].
         """
 
-
+        x = self.proj_to_d_model(x)
         # add positional encoding to context tokens
         x = x + self.positional_embedding[x_masks]
 
@@ -163,7 +165,7 @@ class Predictor(nn.Module):
         y = self.mask_token.expand(*y_masks.shape, -1) + self.positional_embedding[y_masks]
 
         # return only the predictions for the target positions
-        y = self.transformer_blocks(self.proj_to_d_model(torch.cat([x, y], dim=1)))[:, x_masks.shape[1]:]
+        y = self.transformer_blocks(torch.cat([x, y], dim=1))[:, x_masks.shape[1]:]
 
         # project back to original embedding dimension
         y = self.proj_to_embed_dim(self.norm(y))
