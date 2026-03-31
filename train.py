@@ -1,3 +1,4 @@
+import os
 import torch
 import models
 import data_utils as utils
@@ -7,6 +8,9 @@ from tqdm import tqdm
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+logger.info("Using device: %s", device)
 
 #number of target blocks
 npred = 4
@@ -30,15 +34,17 @@ for (images, labels), enc_masks, pred_masks in data_loader_train:
     print(utils.apply_masks(images, enc_masks).shape)
     print(utils.apply_masks(images, pred_masks).shape)
 
-lr = 1e-3
+lr = 1e-3 # too high
+lr = 1e-4 #too low
+lr = 6e-4 #too low
 epochs = 10
 
 
 
 #models
-context_encoder = models.Encoder()
-predictor = models.Predictor()
-target_encoder = models.Encoder(positional_embeddings=context_encoder.positional_embedding)
+context_encoder = models.Encoder().to(device)
+predictor = models.Predictor().to(device)
+target_encoder = models.Encoder(positional_embeddings=context_encoder.positional_embedding).to(device)
 
 #loss and optimizer
 optimizer =  torch.optim.Adam(list({*context_encoder.parameters(), *predictor.parameters()}), lr = lr)
@@ -59,6 +65,11 @@ for epoch in range(epochs):
 
         enc_masks = enc_masks.flatten(start_dim=0, end_dim=1)
         pred_masks = pred_masks.flatten(start_dim=0, end_dim=1)
+
+        nb = device.type == "cuda"
+        images = images.to(device, non_blocking=nb)
+        enc_masks = enc_masks.to(device, non_blocking=nb)
+        pred_masks = pred_masks.to(device, non_blocking=nb)
 
         optimizer.zero_grad()  # Clear previous gradients
 
@@ -93,4 +104,26 @@ for epoch in range(epochs):
         
         
 
+checkpoint_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints")
+os.makedirs(checkpoint_dir, exist_ok=True)
+checkpoint_path = os.path.join(checkpoint_dir, "ijepa_train.pt")
+torch.save(
+    {
+        "context_encoder": context_encoder.state_dict(),
+        "predictor": predictor.state_dict(),
+        "target_encoder": target_encoder.state_dict(),
+        "epochs": epochs,
+    },
+    checkpoint_path,
+)
+logger.info("Saved weights to %s", checkpoint_path)
+
+plt.figure()
 plt.plot(loss_history)
+plt.xlabel("Training step")
+plt.ylabel("MSE loss")
+plt.title("I-JEPA training loss")
+loss_plot_path = os.path.join(checkpoint_dir, "loss.png")
+plt.savefig(loss_plot_path, dpi=150, bbox_inches="tight")
+plt.close()
+logger.info("Saved loss plot to %s", loss_plot_path)
