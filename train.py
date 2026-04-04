@@ -7,8 +7,8 @@ import matplotlib.pyplot as plt
 import torch
 from tqdm import tqdm
 from data_utils import MaskCollator, apply_masks, make_imagenet, make_transforms
-from models import Encoder, Predictor, Tokenizer
-from torch.nn.functional import smooth_l1_loss, mse_loss
+from models import Encoder, Predictor, Tokenizer, ViT
+from torch.nn.functional import smooth_l1_loss, mse_loss, cross_entropy
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +30,7 @@ def run_epoch(
     step_offset=0,
     total_steps=1,
 ):
-    """Run one full epoch."""
+    """Run one full I-JEPA pre-training epoch."""
     context_encoder.train(train)
     predictor.train(train)
     target_encoder.eval()
@@ -69,9 +69,9 @@ def run_epoch(
                 )
                 optimizer.step()
                 if lr_scheduler is not None: lr_scheduler.step()
-                
+
                 with torch.no_grad():
-                    for p_ctx, p_tgt in zip(context_encoder.parameters(), target_encoder.parameters()): 
+                    for p_ctx, p_tgt in zip(context_encoder.parameters(), target_encoder.parameters()):
                         p_tgt.lerp_(p_ctx, 1 - _cosine_anneal(step_offset + steps, total_steps - 1, ema_start, ema_end))
 
             total_loss += loss.item()
@@ -80,32 +80,125 @@ def run_epoch(
 
     return total_loss / steps
 
+
+def run_finetune_epoch(
+    model,
+    loader,
+    device="cpu",
+    train=True,
+    optimizer=None,
+    lr_scheduler=None,
+    full_tune=False,
+):
+    """Run one full linear-probe fine-tuning epoch."""
+    model.train(train)
+    if not full_tune: model.feature_extractor.eval()
+
+    total_loss = 0.0
+    total = 0
+
+    ctx = torch.enable_grad() if train else torch.no_grad()
+    with ctx:
+        pbar = tqdm(loader, desc="train" if train else "val", leave=False)
+        for patches, labels in pbar:
+            loss = cross_entropy(model(patches.to(device)), labels.to(device))
+
+            if train:
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    [p for group in optimizer.param_groups for p in group["params"]],
+                    max_norm=1.0,
+                )
+                optimizer.step()
+                if lr_scheduler is not None: lr_scheduler.step()
+
+            total_loss += loss.item()
+            pbar.set_postfix(loss=f"{loss.item():.4f}")
+
+    return total_loss / len(loader)
+
+
+def evaluate(model, loader, run_name=None, device="cpu"):
+    """Load best checkpoint into model and evaluate accuracy on the given DataLoader."""
+    if run_name is not None:
+        ckpt = torch.load(
+            os.path.join(
+                "checkpoints", 
+                run_name, 
+                "best.pt"
+            ), 
+            map_location="cpu", 
+            weights_only=True
+        )
+        model.load_state_dict(ckpt["model"])
+        logger.info(f"Loaded '{run_name}' (epoch {ckpt.get('epoch', '?')})")
+    
+    model = model.to(device).eval()
+    correct, total = 0, 0
+    with torch.no_grad():
+        for patches, labels in tqdm(loader, desc="eval", leave=False):
+            correct += (model(patches.to(device)).argmax(dim=-1) == labels.to(device)).sum().item()
+            total += labels.size(0)
+    accuracy = correct / total
+    logger.info(f"accuracy={accuracy:.4f} ({correct}/{total})")
+    return accuracy
+
 def trainer(
     train_loader,
     val_loader,
-    context_encoder,
-    predictor,
-    lr=1e-3,
-    weight_decay=0.05,
+    task="pretrain",
+    # pretrain-only
+    context_encoder=None,
+    predictor=None,
     ema_decay_start=0.996,
     ema_decay_end=0.999,
+    # finetune-only
+    model=None,
+    pretrain_checkpoint=None,
+    full_tune=False,
+    # shared
+    lr=1e-3,
+    weight_decay=0.05,
     epochs=100,
     warmup_ratio=0.05,
     min_lr_ratio=0.1,
     device="cpu",
-    save_path="checkpoints",
+    run_name="model",
 ):
-    logger.info(f"Using device: {device}")
+    logger.info(f"Task: {task} | device: {device}")
 
-    target_encoder = copy.deepcopy(context_encoder)
-    for p in target_encoder.parameters(): p.requires_grad_(False)
+    if task == "pretrain":
+        target_encoder = copy.deepcopy(context_encoder)
+        for p in target_encoder.parameters(): p.requires_grad_(False)
 
-    context_encoder = context_encoder.to(device)
-    predictor = predictor.to(device)
-    target_encoder = target_encoder.to(device)
+        context_encoder = context_encoder.to(device)
+        predictor = predictor.to(device)
+        target_encoder = target_encoder.to(device)
+
+        params = list(context_encoder.parameters()) + list(predictor.parameters())
+    else:
+        if pretrain_checkpoint is not None: model.feature_extractor.load_state_dict(torch.load(
+            os.path.join(
+                "checkpoints",
+                pretrain_checkpoint,
+                "best.pt"
+            ), 
+            map_location="cpu", 
+            weights_only=True
+        )["target_encoder"])
+        else: full_tune = True
+
+        if not full_tune: 
+            for p in model.feature_extractor.parameters(): p.requires_grad_(False)
+
+        model = model.to(device)
+
+        params = filter(lambda p: p.requires_grad, model.parameters())
+        
 
     optimizer = torch.optim.AdamW(
-        list(context_encoder.parameters()) + list(predictor.parameters()),
+        params,
         lr=lr,
         weight_decay=weight_decay,
     )
@@ -120,88 +213,114 @@ def trainer(
     )
     logger.info(f"total_steps={total_steps}, warmup_steps={warmup_steps}")
 
+    save_path = os.path.join("checkpoints", f"{run_name}_{task}")
     os.makedirs(save_path, exist_ok=True)
-    best_val = float("inf")
-    train_losses, val_losses = [], []
-    global_step = 0
 
     loss_csv = os.path.join(save_path, "loss.csv")
-    with open(loss_csv, "w", newline="") as f: csv.writer(f).writerow(["epoch", "train_loss", "val_loss"])
+    csv_header = ["epoch", "train_loss", "val_loss"]
+    with open(loss_csv, "w", newline="") as f: csv.writer(f).writerow(csv_header)
+
+    best_val = float("inf")
+    global_step = 0
+    train_losses, val_losses = [], []
 
     for epoch in tqdm(range(1, epochs + 1), desc="epochs"):
-        train_loss = run_epoch(
-            context_encoder,
-            target_encoder,
-            predictor,
-            train_loader,
-            device,
-            train=True,
-            optimizer=optimizer,
-            lr_scheduler=lr_scheduler,
-            ema_start=ema_decay_start,
-            ema_end=ema_decay_end,
-            step_offset=global_step,
-            total_steps=total_steps,
-        )
-        global_step += steps_per_epoch
+        if task == "pretrain":
+            train_loss = run_epoch(
+                context_encoder,
+                target_encoder,
+                predictor,
+                train_loader,
+                device,
+                train=True,
+                optimizer=optimizer,
+                lr_scheduler=lr_scheduler,
+                ema_start=ema_decay_start,
+                ema_end=ema_decay_end,
+                step_offset=global_step,
+                total_steps=total_steps,
+            )
 
-        val_loss = run_epoch(
-            context_encoder,
-            target_encoder,
-            predictor,
-            val_loader,
-            device,
-            train=False,
-        )
+            global_step += steps_per_epoch
 
-        train_losses.append(train_loss)
-        val_losses.append(val_loss)
+            val_loss = run_epoch(
+                context_encoder,
+                target_encoder,
+                predictor,
+                val_loader,
+                device,
+                train=False,
+            )
 
-        with open(loss_csv, "a", newline="") as f: csv.writer(f).writerow([epoch, train_loss, val_loss])
-
-        logger.info(f"Epoch {epoch:>3}/{epochs} | train {train_loss:.4f} | val {val_loss:.4f}")
-
-        if val_loss < best_val:
-            best_val = val_loss
-            torch.save({
-                "epoch": epoch,
+            ckpt = {
                 "context_encoder": context_encoder.state_dict(),
                 "target_encoder":  target_encoder.state_dict(),
                 "predictor":       predictor.state_dict(),
-                "optimizer":       optimizer.state_dict(),
-            }, os.path.join(save_path, "best.pt"))
+            }
+        else:
+            train_loss = run_finetune_epoch(
+                model,
+                train_loader,
+                device,
+                train=True,
+                optimizer=optimizer,
+                lr_scheduler=lr_scheduler,
+            )
+            val_loss = run_finetune_epoch(
+                model,
+                val_loader,
+                device,
+                train=False,
+            )
+
+            ckpt = {"model": model.state_dict()}
+
+        if val_loss < best_val:
+            best_val = val_loss
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "optimizer": optimizer.state_dict()
+                } | ckpt, 
+                os.path.join(save_path, "best.pt")
+            )
+
+        logger.info(f"Epoch {epoch:>3}/{epochs} | train {train_loss:.4f} | val {val_loss:.4f}")
+        with open(loss_csv, "a", newline="") as f: csv.writer(f).writerow([epoch, train_loss, val_loss])
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
 
     ep = range(1, epochs + 1)
     plt.figure(figsize=(8, 4))
     plt.plot(ep, train_losses, label="train")
     plt.plot(ep, val_losses,   label="val")
     plt.xlabel("Epoch")
-    plt.ylabel("MSE Loss")
-    plt.title("I-JEPA Training")
+    plt.ylabel("Loss")
+    plt.title(f"{task}")
     plt.legend()
     plt.tight_layout()
     plt.savefig(os.path.join(save_path, "loss.png"))
     plt.show()
-    logger.info(f"Loss plot saved to {save_path}/loss.png")
+    logger.info(f"Training complete. Best val loss: {best_val:.4f}")
 
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    img_size = 224
+
+    TASK = "finetune"
+
+    img_size   = 224
     patch_size = 16
     encoder_dim = 768
     predictor_dim = 384
     n_head = 8
-    # batch_size = 64
-    batch_size = 2
+    batch_size = 64
     num_patches = (img_size // patch_size) ** 2
 
     tokenizer = Tokenizer(img_size, patch_size)
-    context_encoder = Encoder(num_patches, patch_size=patch_size, d_model=encoder_dim, n_head=n_head, n_layers=12)
-    predictor = Predictor(num_patches, encoder_dim, predictor_dim, n_head, n_layers=6)
-    
+
     data_loader_cfg = dict(
         transform=make_transforms(crop_size=img_size),
-        collator=MaskCollator(input_size=(img_size, img_size), patch_size=patch_size),
+        collator=MaskCollator(input_size=(img_size, img_size), patch_size=patch_size) if TASK == "pretrain" else None,
         batch_size=batch_size,
         local_name="mini-imagenet",
         patcher=tokenizer.encode,
@@ -210,32 +329,76 @@ def main():
 
     train_loader = make_imagenet(
         **data_loader_cfg,
-        # dataset_name="timm/mini-imagenet", # only specify the first time to download
         split="train",
         shuffle=True,
         drop_last=True,
     )
-    val_loader   = make_imagenet(
+    val_loader = make_imagenet(
         **data_loader_cfg,
-        # dataset_name="timm/mini-imagenet", # only specify the first time to download
         split="validation",
         shuffle=False,
         drop_last=False,
     )
+    test_loader = make_imagenet(
+        **data_loader_cfg,
+        split="test",
+        shuffle=False,
+        drop_last=False,
+    )
 
-    trainer(
+    trainer_cfg = dict(
         train_loader=train_loader,
         val_loader=val_loader,
-        context_encoder=context_encoder,
-        predictor=predictor,
-        lr=1e-4,
+        task=TASK,
+        lr=1e-3,
         weight_decay=0.05,
-        epochs=100,
+        epochs=20,
         warmup_ratio=0.1,
         min_lr_ratio=1e-4,
-        ema_decay_start=0.996,
-        ema_decay_end=0.999,
         device="cuda" if torch.cuda.is_available() else "cpu",
     )
+
+    if TASK == "pretrain":
+        context_encoder = Encoder(
+            num_patches=num_patches,
+            patch_size=patch_size,
+            d_model=encoder_dim,
+            n_head=n_head,
+            n_layers=12,
+        )
+        predictor = Predictor(
+            num_patches=num_patches,
+            encoder_dim=encoder_dim,
+            predictor_dim=predictor_dim,
+            n_head=n_head,
+            n_layers=6,
+        )
+
+        trainer(
+            **trainer_cfg,
+            context_encoder=context_encoder,
+            predictor=predictor,
+            ema_decay_start=0.996,
+            ema_decay_end=0.999,
+            run_name="pretrain",
+        )
+    else:
+        vit = ViT(
+            num_patches=num_patches,
+            num_classes=100,
+            patch_size=patch_size,
+            d_model=encoder_dim,
+            n_head=n_head,
+            n_layers=12,
+        )
+        # trainer(
+        #     **trainer_cfg,
+        #     model=vit,
+        #     pretrain_checkpoint="pretrain",
+        #     full_tune=False,
+        #     run_name="target",
+        # )
+        evaluate(vit, test_loader, "vit_baseline", "cuda")
+        
 
 if __name__ == "__main__": main()
