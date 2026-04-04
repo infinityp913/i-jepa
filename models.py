@@ -61,6 +61,9 @@ class TransformerBlock(nn.Module):
 
         Args:
             x (torch.Tensor): Input tensor of shape (batch_size, seq_len, n_embed).
+
+        Returns:
+            torch.Tensor: Output tensor of the same shape as input (batch_size, seq_len, n_embed).
         """
         normed_x = self.ln1(x)
         x = x + self.mha(normed_x, normed_x, normed_x, need_weights=False)[0] # need_weights=False uses the optimized scaled_dot_product_attention
@@ -98,11 +101,13 @@ class Encoder(nn.Module):
         Forward pass of the Encoder.
 
         Args:
-            x (torch.Tensor): Kept patches [B, n_keep, patch_size**2 * img_channels].
-            masks (torch.Tensor): Patch indices to keep [B, n_keep].
+            x (torch.Tensor): Kept patches [B, n_context, patch_size**2 * img_channels].
+            masks (torch.Tensor): Patch indices to keep [B, n_context]. Pass None to use all context patches.
         Returns:
-            torch.Tensor: Embeddings of kept patches [B, n_keep, n_embed].
+            torch.Tensor: Embeddings of kept patches [B, n_context, n_embed].
         """
+
+
         x = self.embed(x) + self.positional_embedding[masks]   # positional emb for kept positions only
         x = self.transformer_blocks(x)
         x = self.norm(x)
@@ -111,14 +116,14 @@ class Encoder(nn.Module):
 class Predictor(nn.Module):
     """A Transformer based predictor for predicting the masked patches."""
 
-    def __init__(self, num_patches, embed_dim=768, d_model=768, n_head=12, n_layers=6):
+    def __init__(self, num_patches, embed_dim=768, d_model=384, n_head=12, n_layers=6):
         """
         Initializes the Predictor.
 
         Args:
             num_patches (int): Number of patches.
             embed_dim (int): Encoder dimension (paper default: 768).
-            d_model (int): Predictor dimension (paper default: 768).
+            d_model (int): Predictor dimension (paper default: 384).
             n_head (int): Number of attention heads.
             n_layers (int): Number of Transformer blocks (paper uses a narrower/shallower predictor).
         """
@@ -142,22 +147,23 @@ class Predictor(nn.Module):
         Forward pass of the Predictor.
 
         Args:
-            x (torch.Tensor):             Context encoder outputs [B, n_keep_enc, n_embed].
-            x_masks (torch.Tensor): Patch indices kept by the encoder [B, n_keep_enc].
-            y_masks (torch.Tensor):  Patch indices to predict [B, n_keep_pred].
+            x (torch.Tensor):             Context encoder outputs [B, n_context, n_embed].
+            x_masks (torch.Tensor): Patch indices kept as context by context encoder [B, n_context].
+            y_masks (torch.Tensor):  Patch indices to predict [B, n_target].
         Returns:
-            torch.Tensor: Predicted embeddings at target positions [B, n_keep_pred, n_embed].
+            torch.Tensor: Predicted embeddings at target positions [B, n_target, n_embed].
         """
-        # add positional encoding to context tokens
+        # embed the context tokens and add positional encoding for kept positions
         x = self.embed(x) + self.positional_embedding[x_masks]
 
         # build mask tokens and add positional encoding for target positions
-        y = self.mask_token.expand(*y_masks.shape, -1) + self.positional_embedding[y_masks]
+        y = self.mask_token[None, None, :].expand(*y_masks.shape, -1) + self.positional_embedding[y_masks]
 
-        # return only the predictions for the target positions
+        # concatenate context and target tokens, run through transformer, slice out target predictions
         y = self.transformer_blocks(torch.cat([x, y], dim=1))[:, x_masks.shape[1]:]
 
-        # project back to original embedding dimension
+        # project back to original context 
+        # encoder dimension
         y = self.proj(self.norm(y))
         return y
 
