@@ -5,3 +5,4 @@ __pycache__/
 datasets/
 .vscode/
 .DS_Store
+*.pt
