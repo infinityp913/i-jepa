@@ -176,17 +176,22 @@ class ViT(nn.Module):
             d_model (int): Encoder dimension.
             n_head (int): Number of attention heads.
             n_layers (int): Number of Transformer encoder blocks.
-            patch_size (int): Patch size.
-            num_classes (int): Number of classes.
         """
         super().__init__()
         self.feature_extractor = Encoder(num_patches, patch_size, img_channels, d_model, n_head, n_layers)
-        
         self.linear_head = nn.Linear(d_model, num_classes)
 
     def forward(self, x):
         """
         Forward pass of the ViT.
+
+        Args:
+            x (torch.Tensor): Pre-tokenized patches [B, N, patch_dim] or
+                raw image tensor [B, C, H, W] — both accepted.
+                When raw images are given, the Encoder's embed layer handles
+                projection. Pass pre-tokenized patches for efficiency.
+        Returns:
+            torch.Tensor: Class logits [B, num_classes].
         """
         x = self.feature_extractor(x)
         x = self.linear_head(x.mean(dim=1))
