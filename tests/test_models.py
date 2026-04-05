@@ -54,7 +54,7 @@ def test_vit_single_channel():
 
 def test_predictor():
     num_patches, n_ctx, n_target = 196, 100, 20
-    predictor = Predictor(num_patches=num_patches, encoder_dim=768, d_model=384, n_head=6, n_layers=2)
+    predictor = Predictor(num_patches=num_patches, embed_dim=768, d_model=384, n_head=6, n_layers=2)
     x = torch.randn(4, n_ctx, 768)
     x_masks = torch.stack([torch.randperm(num_patches)[:n_ctx] for _ in range(4)])
     y_masks = torch.stack([torch.randperm(num_patches)[:n_target] for _ in range(4)])
