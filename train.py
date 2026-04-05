@@ -2,11 +2,11 @@ import copy
 import csv
 import math
 import logging
-import os
+from pathlib import Path
 import matplotlib.pyplot as plt
 import torch
 from tqdm import tqdm
-from data_utils import MaskCollator, apply_masks, make_imagenet, make_transforms, make_bdd, IMAGENET_SIZE, IMAGENET_NORMALIZATION, BDD_SIZE, BDD_NORMALIZATION
+from data_utils import MaskCollator, apply_masks, make_transforms, make_imagenet, make_bdd, IMAGENET_SIZE, IMAGENET_NORMALIZATION, BDD_SIZE, BDD_NORMALIZATION
 from models import Encoder, Predictor, Tokenizer, ViT
 from torch.nn.functional import smooth_l1_loss, mse_loss, cross_entropy
 
@@ -16,7 +16,7 @@ def _cosine_anneal(step, total_steps, start, end):
     """Cosine interpolation from start (step=0) to end (step=total_steps)."""
     return start + (end - start) * 0.5 * (1.0 - math.cos(math.pi * step / total_steps)) if total_steps > 0 else end
 
-def run_epoch(
+def run_pretrain_epoch(
     context_encoder,
     target_encoder,
     predictor,
@@ -95,7 +95,6 @@ def run_finetune_epoch(
     if not full_tune: model.feature_extractor.eval()
 
     total_loss = 0.0
-    total = 0
 
     ctx = torch.enable_grad() if train else torch.no_grad()
     with ctx:
@@ -123,13 +122,9 @@ def evaluate(model, loader, run_name=None, device="cpu"):
     """Load best checkpoint into model and evaluate accuracy on the given DataLoader."""
     if run_name is not None:
         ckpt = torch.load(
-            os.path.join(
-                "checkpoints", 
-                run_name, 
-                "best.pt"
-            ), 
+            Path("checkpoints") / run_name / "best.pt",
             map_location="cpu", 
-            weights_only=True
+            weights_only=True,
         )
         model.load_state_dict(ckpt["model"])
         logger.info(f"Loaded '{run_name}' (epoch {ckpt.get('epoch', '?')})")
@@ -179,13 +174,9 @@ def trainer(
         params = list(context_encoder.parameters()) + list(predictor.parameters())
     else:
         if pretrain_checkpoint is not None: model.feature_extractor.load_state_dict(torch.load(
-            os.path.join(
-                "checkpoints",
-                pretrain_checkpoint,
-                "best.pt"
-            ), 
+            Path("checkpoints") / pretrain_checkpoint / "best.pt",
             map_location="cpu", 
-            weights_only=True
+            weights_only=True,
         )["target_encoder"])
         else: full_tune = True
 
@@ -213,10 +204,10 @@ def trainer(
     )
     logger.info(f"total_steps={total_steps}, warmup_steps={warmup_steps}")
 
-    save_path = os.path.join("checkpoints", f"{run_name}_{task}")
-    os.makedirs(save_path, exist_ok=True)
+    save_path = Path("checkpoints") / f"{run_name}_{task}"
+    save_path.mkdir(parents=True, exist_ok=True)
 
-    loss_csv = os.path.join(save_path, "loss.csv")
+    loss_csv = save_path / "loss.csv"
     csv_header = ["epoch", "train_loss", "val_loss"]
     with open(loss_csv, "w", newline="") as f: csv.writer(f).writerow(csv_header)
 
@@ -226,7 +217,7 @@ def trainer(
 
     for epoch in tqdm(range(1, epochs + 1), desc="epochs"):
         if task == "pretrain":
-            train_loss = run_epoch(
+            train_loss = run_pretrain_epoch(
                 context_encoder,
                 target_encoder,
                 predictor,
@@ -243,7 +234,7 @@ def trainer(
 
             global_step += steps_per_epoch
 
-            val_loss = run_epoch(
+            val_loss = run_pretrain_epoch(
                 context_encoder,
                 target_encoder,
                 predictor,
@@ -282,7 +273,7 @@ def trainer(
                     "epoch": epoch,
                     "optimizer": optimizer.state_dict()
                 } | ckpt, 
-                os.path.join(save_path, "best.pt")
+                save_path / "best.pt"
             )
 
         logger.info(f"Epoch {epoch:>3}/{epochs} | train {train_loss:.4f} | val {val_loss:.4f}")
@@ -299,52 +290,47 @@ def trainer(
     plt.title(f"{task}")
     plt.legend()
     plt.tight_layout()
-    plt.savefig(os.path.join(save_path, "loss.png"))
+    plt.savefig(save_path / "loss.png")
     plt.show()
     logger.info(f"Training complete. Best val loss: {best_val:.4f}")
 
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-    TASK = "pretrain"
+    TASK = "finetune"
 
     patch_size = 16
-    encoder_dim = 128
-    predictor_dim = 64
+    encoder_dim = 768
+    predictor_dim = 384
     n_head = 8
-    num_patches = math.prod(BDD_SIZE) // patch_size ** 2
+    num_patches = math.prod(IMAGENET_SIZE) // patch_size ** 2
 
-    tokenizer = Tokenizer(BDD_SIZE, patch_size)
+    tokenizer = Tokenizer(IMAGENET_SIZE, patch_size)
 
     data_loader_cfg = dict(
-        mode=TASK,
-        transform=make_transforms(normalization=BDD_NORMALIZATION),
-        collator=MaskCollator(input_size=BDD_SIZE, patch_size=patch_size) if TASK == "pretrain" else None,
+        local_name="mini-imagenet",
+        transform=make_transforms(crop_size=IMAGENET_SIZE, normalization=IMAGENET_NORMALIZATION),
+        collator=MaskCollator(input_size=IMAGENET_SIZE, patch_size=patch_size) if TASK == "pretrain" else None,
         patcher=tokenizer.encode,
         num_workers=2,
     )
 
-    train_loader = make_bdd(
+    train_loader = make_imagenet(
         **data_loader_cfg,
         batch_size=64,
         split="train",
         shuffle=True,
         drop_last=True,
     )
-    val_loader = make_bdd(
+    val_loader = make_imagenet(
         **data_loader_cfg,
         batch_size=256,
-        split="val",
+        split="validation",
         shuffle=False,
         drop_last=False,
     )
-    test_loader = make_bdd(
-        **data_loader_cfg,
-        batch_size=256,
-        split="test",
-        shuffle=False,
-        drop_last=False,
-    )
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
     trainer_cfg = dict(
         train_loader=train_loader,
@@ -355,7 +341,7 @@ def main():
         epochs=100,
         warmup_ratio=0.1,
         min_lr_ratio=1e-4,
-        device="cuda" if torch.cuda.is_available() else "cpu",
+        device=device,
     )
 
     if TASK == "pretrain":
@@ -383,6 +369,13 @@ def main():
             run_name="bdd",
         )
     else:
+        test_loader = make_imagenet(
+            **data_loader_cfg,
+            batch_size=256,
+            split="test",
+            shuffle=False,
+            drop_last=False,
+        )
         vit = ViT(
             num_patches=num_patches,
             num_classes=100,
@@ -398,7 +391,7 @@ def main():
         #     full_tune=False,
         #     run_name="target",
         # )
-        evaluate(vit, test_loader, "vit_baseline", "cuda")
+        evaluate(vit, test_loader, "context_finetune", device)
         
 
 if __name__ == "__main__": main()
