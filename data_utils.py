@@ -494,7 +494,7 @@ def make_bdd(
     
     if split not in ("train", "validation", "test"): raise ValueError(f"split must be train, validation, or test; got {split!r}")
 
-    subset_root = Path(_DATASETS_DIR, "BDD", subset)
+    subset_root = Path(_DATASETS_DIR, "bdd", subset)
 
     data_loader = torch.utils.data.DataLoader(
         dataset=BDDDataset(
