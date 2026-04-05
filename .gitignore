@@ -6,3 +6,4 @@ datasets/
 .vscode/
 .DS_Store
 *.pt
+checkpoints/
