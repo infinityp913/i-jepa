@@ -6,7 +6,7 @@ import os
 import matplotlib.pyplot as plt
 import torch
 from tqdm import tqdm
-from data_utils import MaskCollator, apply_masks, make_imagenet, make_transforms
+from data_utils import MaskCollator, apply_masks, make_imagenet, make_transforms, make_bdd, IMAGENET_SIZE, IMAGENET_NORMALIZATION, BDD_SIZE, BDD_NORMALIZATION
 from models import Encoder, Predictor, Tokenizer, ViT
 from torch.nn.functional import smooth_l1_loss, mse_loss, cross_entropy
 
@@ -306,41 +306,41 @@ def trainer(
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-    TASK = "finetune"
+    TASK = "pretrain"
 
-    img_size   = 224
     patch_size = 16
-    encoder_dim = 768
-    predictor_dim = 384
+    encoder_dim = 128
+    predictor_dim = 64
     n_head = 8
-    batch_size = 64
-    num_patches = (img_size // patch_size) ** 2
+    num_patches = math.prod(BDD_SIZE) // patch_size ** 2
 
-    tokenizer = Tokenizer(img_size, patch_size)
+    tokenizer = Tokenizer(BDD_SIZE, patch_size)
 
     data_loader_cfg = dict(
-        transform=make_transforms(crop_size=img_size),
-        collator=MaskCollator(input_size=(img_size, img_size), patch_size=patch_size) if TASK == "pretrain" else None,
-        batch_size=batch_size,
-        local_name="mini-imagenet",
+        mode=TASK,
+        transform=make_transforms(normalization=BDD_NORMALIZATION),
+        collator=MaskCollator(input_size=BDD_SIZE, patch_size=patch_size) if TASK == "pretrain" else None,
         patcher=tokenizer.encode,
         num_workers=2,
     )
 
-    train_loader = make_imagenet(
+    train_loader = make_bdd(
         **data_loader_cfg,
+        batch_size=64,
         split="train",
         shuffle=True,
         drop_last=True,
     )
-    val_loader = make_imagenet(
+    val_loader = make_bdd(
         **data_loader_cfg,
-        split="validation",
+        batch_size=256,
+        split="val",
         shuffle=False,
         drop_last=False,
     )
-    test_loader = make_imagenet(
+    test_loader = make_bdd(
         **data_loader_cfg,
+        batch_size=256,
         split="test",
         shuffle=False,
         drop_last=False,
@@ -350,9 +350,9 @@ def main():
         train_loader=train_loader,
         val_loader=val_loader,
         task=TASK,
-        lr=1e-3,
+        lr=1.5e-4,
         weight_decay=0.05,
-        epochs=20,
+        epochs=100,
         warmup_ratio=0.1,
         min_lr_ratio=1e-4,
         device="cuda" if torch.cuda.is_available() else "cpu",
@@ -368,8 +368,8 @@ def main():
         )
         predictor = Predictor(
             num_patches=num_patches,
-            encoder_dim=encoder_dim,
-            predictor_dim=predictor_dim,
+            embed_dim=encoder_dim,
+            d_model=predictor_dim,
             n_head=n_head,
             n_layers=6,
         )
@@ -379,8 +379,8 @@ def main():
             context_encoder=context_encoder,
             predictor=predictor,
             ema_decay_start=0.996,
-            ema_decay_end=0.999,
-            run_name="pretrain",
+            ema_decay_end=1.0,
+            run_name="bdd",
         )
     else:
         vit = ViT(

@@ -16,12 +16,10 @@ from PIL import Image
 logger = logging.getLogger(__name__)
 _DATASETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "datasets")
 
-
 def make_transforms(
-    crop_size=224,
+    crop_size=None,
     crop_scale=(0.3, 1.0),
-    normalization=((0.485, 0.456, 0.406),
-                   (0.229, 0.224, 0.225)),
+    normalization=(0, 1),
 ):
     """
     Build the pre-training image transform for I-JEPA.
@@ -32,12 +30,10 @@ def make_transforms(
     """
     logger.info("Building data transforms")
 
-    normalization = (0, 1) if normalization is None else normalization
-
-    return transforms.Compose(([] if crop_size is None else [transforms.RandomResizedCrop(crop_size, scale=crop_scale)]) + [
-        transforms.ToTensor(),
-        transforms.Normalize(normalization[0], normalization[1]),
-    ])
+    return transforms.Compose(
+        ([transforms.RandomResizedCrop(crop_size, scale=crop_scale)] if crop_size else [])
+        + [transforms.ToTensor(), transforms.Normalize(*normalization)]
+    )
 
 class MaskCollator:
     """
@@ -55,7 +51,7 @@ class MaskCollator:
 
     def __init__(
         self,
-        input_size=(224, 224),
+        input_size,
         patch_size=16,
         enc_mask_scale=(0.85, 1.0),
         pred_mask_scale=(0.15, 0.2),
@@ -229,6 +225,13 @@ def apply_masks(x, masks):
         dim=0
     )
 
+IMAGENET_SIZE: Tuple[int, int] = (224, 224)
+
+IMAGENET_NORMALIZATION = (
+    (0.485, 0.456, 0.406),
+    (0.229, 0.224, 0.225)
+)
+
 class ImageNetDataset(torch.utils.data.Dataset):
     def __init__(self, hf_dataset, transform, patcher=None):
         self.hf_dataset = hf_dataset
@@ -347,34 +350,19 @@ labels = [
 NUM_CLASSES = len(labels) - 1
 TRAINID_TO_COLOR = {lb.id: lb.color for lb in labels}
 TRAINID_TO_NAME = {lb.id: lb.name for lb in labels}
-BDD_PIL_SIZE: Tuple[int, int] = (1280, 720)
 
+BDD_SIZE: Tuple[int, int] = (720, 1280)
 
-def _bdd_image_paths(images_dir: Union[str, Path]) -> List[Path]:
-    """
-    Sorted ``*.jpg`` under ``images_dir``; keep only files whose PIL size is
-    ``BDD_PIL_SIZE``.
-    """
-    all_jpg = sorted(Path(images_dir).glob("*.jpg"))
-    kept = []
-    for img_path in all_jpg:
-        with Image.open(img_path) as img:
-            if img.size == BDD_PIL_SIZE: kept.append(img_path)
-    logger.info(
-        "BDD image list: kept %d / %d under %s%s",
-        len(kept),
-        len(all_jpg),
-    )
-    return kept
-
+BDD_NORMALIZATION = (
+    (0.279, 0.293, 0.290),
+    (0.247, 0.265, 0.276)
+)
 
 class BDDDataset(torch.utils.data.Dataset):
     """
-    BDD images at ``BDD_PIL_SIZE`` (see ``_bdd_image_paths``).
-
-    Each sample is built as ``np.array(pil, dtype=np.float32).transpose(2, 0, 1) / 255.0``, then a
-    ``torch`` tensor, then ``transform`` (use ``make_transforms(..., to_tensor=False)`` so you do not
-    run ``ToTensor`` twice).
+    PIL images are passed directly to ``transform``; the default ``make_transforms`` pipeline
+    (``RandomResizedCrop`` → ``ToTensor`` → ``Normalize``) handles cropping, CHW conversion,
+    and normalisation.
 
     * ``labels_dir is None``: pre-training — returns ``(tensor, 0)`` for ``MaskCollator``.
     * ``labels_dir`` set: segmentation — returns ``(image_tensor, mask_long)``; mask is never transformed.
@@ -397,14 +385,13 @@ class BDDDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, Union[torch.Tensor, int]]:
         img_path = self.image_paths[idx]
-        with Image.open(img_path) as im:
-            img = self.transform(torch.from_numpy(np.ascontiguousarray(np.array(im.convert("RGB"), dtype=np.float32).transpose(2, 0, 1) / 255.0)))
-        out = self.patcher(img.unsqueeze(0)).squeeze(0) if self.patcher else img
-        mask = torch.from_numpy(np.array(Image.open(self.labels_dir / f"{img_path.stem}_train_id.png"), dtype=np.uint8)).long() if self.labels_dir else None
-        return out, mask
+        with Image.open(img_path) as im: img = self.transform(im.convert("RGB"))
+        return (
+            self.patcher(img.unsqueeze(0)).squeeze(0) if self.patcher else img,
+            torch.from_numpy(np.array(Image.open(self.labels_dir / f"{img_path.stem}_train_id.png"), dtype=np.uint8)).long() if self.labels_dir else -1
+        )
 
-
-def make_bdd_dataloader(
+def make_bdd(
     mode: str,
     split: str,
     transform: Callable[..., torch.Tensor],
@@ -423,11 +410,11 @@ def make_bdd_dataloader(
         mode: ``"pretrain"`` → ``100k`` images only; ``"segmentation"`` → ``10k``
             images + ``labels/{split}/*_train_id.png`` (``split`` must be ``train`` or ``val``).
         split: ``train``, ``val``, or ``test`` (``test`` only for pretrain).
-        transform: Required. ``BDDDataset`` converts PIL to ``float32`` CHW ``[0,1]`` then calls this;
-            use ``make_transforms(crop_size=None, to_tensor=False)`` so ``Normalize`` runs without ``ToTensor``.
+        transform: Required. PIL images are passed directly to this; use ``make_transforms``
+            which handles cropping, ``ToTensor``, and normalisation.
         patcher: Used only for ``pretrain`` (e.g. tokenizer ``encode``).
-        collate_fn: e.g. ``MaskCollator`` for pretrain.
-        bdd_root: Defaults to ``datasets/BDD`` next to this package.
+        collator: e.g. ``MaskCollator`` for pretrain.
+            Dataset root is ``datasets/BDD`` next to this file.
     """
     mode = mode.lower()
     if mode == "pretrain":
@@ -438,14 +425,14 @@ def make_bdd_dataloader(
         if split not in ("train", "val"): raise ValueError(f"segmentation split must be train or val; got {split!r}")
     else: raise ValueError(f"mode must be 'pretrain' or 'segmentation'; got {mode!r}")
 
-    bdd_root = os.path.join(_DATASETS_DIR, "BDD")
+    subset_root = Path(_DATASETS_DIR, "BDD", subset)
 
     data_loader = torch.utils.data.DataLoader(
         dataset=BDDDataset(
-            image_paths=_bdd_image_paths(os.path.join(bdd_root, subset, "images", split)),
+            image_paths=(subset_root / "images" / split).glob("*.jpg"),
             transform=transform,
             patcher=patcher,
-            labels_dir=None if mode == "pretrain" else os.path.join(bdd_root, subset, "labels", split)
+            labels_dir=None if mode == "pretrain" else subset_root / "labels" / split
         ),
         collate_fn=collator,
         shuffle=shuffle,
@@ -453,13 +440,18 @@ def make_bdd_dataloader(
         drop_last=drop_last,
         pin_memory=pin_mem,
         num_workers=num_workers,
-        persistent_workers=num_workers,
+        persistent_workers=(num_workers > 0),
     )
 
     logger.info("DataLoader created")
     
     return data_loader
 
+def _label_to_rgb(label):
+    """Convert class index mask (H,W) to RGB (H,W,3) in [0,1] for display."""
+    out = np.zeros((*label.shape, 3), dtype=np.uint8)
+    for cid, color in TRAINID_TO_COLOR.items(): out[label == cid] = color
+    return out.astype(np.float32) / 255.0
 
 def _overlay_mask_on_image(image, mask_indices, patch_size, grid_size, darken=0.65):
     """Overlay a mask on an image, only for visualization."""
@@ -474,17 +466,27 @@ def main():
     from models import Tokenizer
     import matplotlib.pyplot as plt
 
-    tokenizer = Tokenizer(img_size=224, patch_size=16)
-    collator = MaskCollator()
+    size = IMAGENET_SIZE
+
+    tokenizer = Tokenizer(img_size=size, patch_size=16)
+    collator = MaskCollator(input_size=size)
 
     data_loader = make_imagenet(
         dataset_name="timm/mini-imagenet", # only specify the first time to download
         local_name="mini-imagenet",
-        transform=make_transforms(normalization=(0, 1)), # for visuslization, no normalization
+        transform=make_transforms(crop_size=size), # for visuslization, no normalization
         patcher=tokenizer.encode,
         collator=collator,
         split="test"
     )
+
+    # data_loader = make_bdd(
+    #     mode="segmentation",
+    #     split="val",
+    #     transform=make_transforms(),
+    #     patcher=tokenizer.encode,
+    #     collator=collator,
+    # )
 
     for (images, labels), enc_masks, pred_masks in data_loader:
         print(apply_masks(images, enc_masks).shape)
@@ -516,19 +518,4 @@ def main():
         plt.tight_layout()
         plt.show()
 
-if __name__ == "__main__": #main()
-    data_loader = make_bdd_dataloader(
-        mode="pretrain",
-        split="train",
-        transform=make_transforms(normalization=(0, 1)),
-        patcher=None,
-        collator=None,
-        pin_mem=True,
-        shuffle=True,
-        num_workers=os.cpu_count(),
-        drop_last=True,
-    )
-    for images, masks in data_loader:
-        print(images.shape)
-        print(masks.shape)
-        break
+if __name__ == "__main__": main()
