@@ -28,6 +28,7 @@ def run_pretrain_epoch(
     lr_scheduler=None,
     ema_start=0.996,
     ema_end=1.0,
+    _tgt_stream=None,
     step_offset=0,
     total_steps=1,
 ):
@@ -38,7 +39,6 @@ def run_pretrain_epoch(
 
     total_loss = torch.zeros(1, device=device)
     steps = 0
-    _tgt_stream = torch.cuda.Stream(device) if device != "cpu" else None
     stream_ctx = torch.cuda.stream(_tgt_stream) if _tgt_stream else contextlib.nullcontext()
     if train: opt_params = [p for group in optimizer.param_groups for p in group["params"]]
 
@@ -224,6 +224,8 @@ def trainer(
     global_step = 0
     train_losses, val_losses = [], []
 
+    if task == "pretrain": _tgt_stream = torch.cuda.Stream(device) if device != "cpu" else None
+
     for epoch in tqdm(range(1, epochs + 1), desc="epochs"):
         if task == "pretrain":
             train_loss = run_pretrain_epoch(
@@ -237,6 +239,7 @@ def trainer(
                 lr_scheduler=lr_scheduler,
                 ema_start=ema_decay_start,
                 ema_end=ema_decay_end,
+                _tgt_stream=_tgt_stream,
                 step_offset=global_step,
                 total_steps=total_steps,
             )
@@ -250,6 +253,7 @@ def trainer(
                 val_loader,
                 device,
                 train=False,
+                _tgt_stream=_tgt_stream,
             )
 
         else:
@@ -325,7 +329,7 @@ def main():
 
     train_loader = make_imagenet(
         **data_loader_cfg,
-        batch_size=128,
+        batch_size=64,
         split="train",
         shuffle=True,
         drop_last=True,
