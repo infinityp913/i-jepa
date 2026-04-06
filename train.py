@@ -9,6 +9,7 @@ from tqdm import tqdm
 from data_utils import MaskCollator, apply_masks, make_transforms, make_imagenet, make_bdd, IMAGENET_SIZE, IMAGENET_NORMALIZATION, BDD_SIZE, BDD_NORMALIZATION
 from models import Encoder, Predictor, Tokenizer, ViT
 from torch.nn.functional import smooth_l1_loss, mse_loss, cross_entropy
+import contextlib
 
 logger = logging.getLogger(__name__)
 
@@ -35,26 +36,37 @@ def run_pretrain_epoch(
     predictor.train(train)
     target_encoder.eval()
 
-    total_loss = 0.0
+    total_loss = torch.zeros(1, device=device)
     steps = 0
+    _tgt_stream = torch.cuda.Stream(device) if device != "cpu" else None
+    stream_ctx = torch.cuda.stream(_tgt_stream) if _tgt_stream else contextlib.nullcontext()
+    if train: opt_params = [p for group in optimizer.param_groups for p in group["params"]]
 
-    ctx = torch.enable_grad() if train else torch.no_grad()
-    with ctx:
+    with torch.set_grad_enabled(train):
         pbar = tqdm(loader, desc="train" if train else "val", leave=False)
         for (patches, _), enc_masks, pred_masks in pbar:
-            patches = patches.to(device)
-            enc_masks = enc_masks.to(device)
-            pred_masks = pred_masks.to(device)
+            n_enc_masks, n_pred_masks = enc_masks.shape[0], pred_masks.shape[0]
 
-            x_embed = context_encoder(apply_masks(patches, enc_masks), enc_masks.flatten(0, 1))
+            patches = patches.to(device, non_blocking=True)
+            enc_masks = enc_masks.to(device, non_blocking=True)
+            pred_masks = pred_masks.to(device, non_blocking=True)
 
-            with torch.no_grad(): y_embed = apply_masks(target_encoder(patches), pred_masks)
+            if _tgt_stream: _tgt_stream.wait_stream(torch.cuda.current_stream())
+
+            with stream_ctx, torch.no_grad(): y_embed = apply_masks(target_encoder(patches), pred_masks).repeat(1, n_enc_masks, 1, 1).flatten(0, 1)
+
+            x_embed = context_encoder(
+                apply_masks(patches, enc_masks).flatten(0, 1),
+                enc_masks.flatten(0, 1)
+            )
 
             y_pred = predictor(
-                x_embed.repeat(len(pred_masks), 1, 1),
-                enc_masks.repeat(len(pred_masks), 1, 1).flatten(0, 1),
-                pred_masks.flatten(0, 1),
+                x_embed.repeat(n_pred_masks, 1, 1),
+                enc_masks.repeat(n_pred_masks, 1, 1).flatten(0, 1),
+                pred_masks.repeat(1, n_enc_masks, 1).flatten(0, 1),
             )
+
+            if _tgt_stream: torch.cuda.current_stream().wait_stream(_tgt_stream)
 
             loss = smooth_l1_loss(y_pred, y_embed)
             #replace with loss from paper (below) if needed, the above loss is more stable
@@ -63,22 +75,19 @@ def run_pretrain_epoch(
             if train:
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(
-                    [p for group in optimizer.param_groups for p in group["params"]],
-                    max_norm=1.0,
-                )
+                torch.nn.utils.clip_grad_norm_(opt_params, max_norm=1.0)
                 optimizer.step()
                 if lr_scheduler is not None: lr_scheduler.step()
 
+                ema_weight = 1 - _cosine_anneal(step_offset + steps, total_steps - 1, ema_start, ema_end)
                 with torch.no_grad():
                     for p_ctx, p_tgt in zip(context_encoder.parameters(), target_encoder.parameters()):
-                        p_tgt.lerp_(p_ctx, 1 - _cosine_anneal(step_offset + steps, total_steps - 1, ema_start, ema_end))
+                        p_tgt.lerp_(p_ctx, ema_weight)
 
-            total_loss += loss.item()
+            total_loss += loss.detach()
             steps += 1
-            pbar.set_postfix(loss=f"{loss.item():.4f}")
 
-    return total_loss / steps
+    return (total_loss / steps).item()
 
 
 def run_finetune_epoch(
@@ -94,28 +103,26 @@ def run_finetune_epoch(
     model.train(train)
     if not full_tune: model.feature_extractor.eval()
 
-    total_loss = 0.0
+    total_loss = torch.zeros(1, device=device)
+    steps = 0
+    if train: opt_params = [p for group in optimizer.param_groups for p in group["params"]]
 
-    ctx = torch.enable_grad() if train else torch.no_grad()
-    with ctx:
+    with torch.set_grad_enabled(train):
         pbar = tqdm(loader, desc="train" if train else "val", leave=False)
         for patches, labels in pbar:
-            loss = cross_entropy(model(patches.to(device)), labels.to(device))
+            loss = cross_entropy(model(patches.to(device, non_blocking=True)), labels.to(device, non_blocking=True))
 
             if train:
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(
-                    [p for group in optimizer.param_groups for p in group["params"]],
-                    max_norm=1.0,
-                )
+                torch.nn.utils.clip_grad_norm_(opt_params, max_norm=1.0)
                 optimizer.step()
                 if lr_scheduler is not None: lr_scheduler.step()
 
-            total_loss += loss.item()
-            pbar.set_postfix(loss=f"{loss.item():.4f}")
+            total_loss += loss.detach()
+            steps += 1
 
-    return total_loss / len(loader)
+    return (total_loss / steps).item()
 
 
 def evaluate(model, loader, run_name=None, device="cpu"):
@@ -130,13 +137,14 @@ def evaluate(model, loader, run_name=None, device="cpu"):
         logger.info(f"Loaded '{run_name}' (epoch {ckpt.get('epoch', '?')})")
     
     model = model.to(device).eval()
-    correct, total = 0, 0
-    with torch.no_grad():
+    correct_tensor = torch.zeros(1, dtype=torch.long, device=device)
+    total = 0
+    with torch.inference_mode():
         for patches, labels in tqdm(loader, desc="eval", leave=False):
-            correct += (model(patches.to(device)).argmax(dim=-1) == labels.to(device)).sum().item()
+            correct_tensor += (model(patches.to(device, non_blocking=True)).argmax(dim=-1) == labels.to(device, non_blocking=True)).sum()
             total += labels.size(0)
-    accuracy = correct / total
-    logger.info(f"accuracy={accuracy:.4f} ({correct}/{total})")
+    accuracy = correct_tensor.item() / total
+    logger.info(f"accuracy={accuracy:.4f} ({correct_tensor.item()}/{total})")
     return accuracy
 
 def trainer(
@@ -192,6 +200,7 @@ def trainer(
         params,
         lr=lr,
         weight_decay=weight_decay,
+        fused=True
     )
 
     steps_per_epoch = len(train_loader)
@@ -243,11 +252,6 @@ def trainer(
                 train=False,
             )
 
-            ckpt = {
-                "context_encoder": context_encoder.state_dict(),
-                "target_encoder":  target_encoder.state_dict(),
-                "predictor":       predictor.state_dict(),
-            }
         else:
             train_loss = run_finetune_epoch(
                 model,
@@ -264,10 +268,13 @@ def trainer(
                 train=False,
             )
 
-            ckpt = {"model": model.state_dict()}
-
         if val_loss < best_val:
             best_val = val_loss
+            ckpt = {
+                "context_encoder": context_encoder.state_dict(),
+                "target_encoder":  target_encoder.state_dict(),
+                "predictor":       predictor.state_dict(),
+            } if task == "pretrain" else {"model": model.state_dict()}
             torch.save(
                 {
                     "epoch": epoch,
@@ -275,6 +282,7 @@ def trainer(
                 } | ckpt, 
                 save_path / "best.pt"
             )
+            del ckpt
 
         logger.info(f"Epoch {epoch:>3}/{epochs} | train {train_loss:.4f} | val {val_loss:.4f}")
         with open(loss_csv, "a", newline="") as f: csv.writer(f).writerow([epoch, train_loss, val_loss])
@@ -297,7 +305,7 @@ def trainer(
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-    TASK = "finetune"
+    TASK = "pretrain"
 
     patch_size = 16
     encoder_dim = 768
@@ -317,14 +325,14 @@ def main():
 
     train_loader = make_imagenet(
         **data_loader_cfg,
-        batch_size=64,
+        batch_size=128,
         split="train",
         shuffle=True,
         drop_last=True,
     )
     val_loader = make_imagenet(
         **data_loader_cfg,
-        batch_size=256,
+        batch_size=128,
         split="validation",
         shuffle=False,
         drop_last=False,
@@ -366,7 +374,7 @@ def main():
             predictor=predictor,
             ema_decay_start=0.996,
             ema_decay_end=1.0,
-            run_name="bdd",
+            run_name="imagenet",
         )
     else:
         test_loader = make_imagenet(

@@ -252,20 +252,17 @@ class MaskCollator:
             ]))
         )
 
-def apply_masks(x: torch.Tensor, masks: List[torch.Tensor]) -> torch.Tensor:
+def apply_masks(x: torch.Tensor, masks: torch.Tensor) -> torch.Tensor:
     """Select patch embeddings at the positions given by *masks*.
 
     Args:
         x: Patch embeddings of shape ``[B, N, D]``.
-        masks: List of tensors, each ``[B, n_keep]``, containing patch indices.
+        masks: A tensor ``[M, B, n_keep]`` containing patch indices.
 
     Returns:
-        Tensor of shape ``[len(masks)*B, n_keep, D]``.
+        Tensor of shape ``[M, B, n_keep, D]``.
     """
-    return torch.cat(
-        [torch.gather(x, dim=1, index=m.unsqueeze(-1).repeat(1, 1, x.size(-1))) for m in masks],
-        dim=0
-    )
+    return torch.take_along_dim(x[None, ...], masks[..., None], dim=2)
 
 IMAGENET_SIZE: Tuple[int, int] = (224, 224)
 
