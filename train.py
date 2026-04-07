@@ -111,7 +111,7 @@ def run_pretrain_epoch(
                             ema_start,
                             ema_end,
                         )
-                        for p_ctx, p_tgt in zip(context_encoder.parameters(), target_encoder.parameters()): p_tgt.lerp_(p_ctx, ema_weight)
+                        torch._foreach_lerp_(list(target_encoder.parameters()), list(context_encoder.parameters()), ema_weight)
 
             total_loss += loss.detach()
             steps += 1
@@ -236,9 +236,9 @@ def trainer(
         target_encoder = copy.deepcopy(context_encoder)
         for p in target_encoder.parameters(): p.requires_grad_(False)
 
-        context_encoder = torch.compile(context_encoder.to(device), dynamic=True)
-        predictor = torch.compile(predictor.to(device), dynamic=True)
-        target_encoder = torch.compile(target_encoder.to(device), dynamic=True)
+        context_encoder = torch.compile(context_encoder.to(device), backend="aot_eager")
+        predictor = torch.compile(predictor.to(device), backend="aot_eager")
+        target_encoder = torch.compile(target_encoder.to(device), backend="aot_eager")
 
         params = list(context_encoder.parameters()) + list(predictor.parameters())
     else:
@@ -252,7 +252,7 @@ def trainer(
         if not full_tune: 
             for p in model.feature_extractor.parameters(): p.requires_grad_(False)
 
-        model = torch.compile(model.to(device), dynamic=True)
+        model = torch.compile(model.to(device), backend="aot_eager")
 
         params = filter(lambda p: p.requires_grad, model.parameters())
         
@@ -354,7 +354,6 @@ def trainer(
                 } | ckpt, 
                 save_path / "best.pt"
             )
-            del ckpt
 
         logger.info(f"Epoch {epoch:>3}/{epochs} | train {train_loss:.4f} | val {val_loss:.4f}")
         with open(loss_csv, "a", newline="") as f: csv.writer(f).writerow([epoch, train_loss, val_loss])
@@ -394,6 +393,7 @@ def main():
         collator=MaskCollator(input_size=IMAGENET_SIZE, patch_size=patch_size) if TASK == "pretrain" else None,
         patcher=tokenizer.encode,
         num_workers=2,
+        prefetch_factor=2,
     )
 
     train_loader = make_imagenet(

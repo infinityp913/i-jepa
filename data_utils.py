@@ -309,6 +309,7 @@ def make_imagenet(
     shuffle: bool = True,
     num_workers: int = 1,
     drop_last: bool = True,
+    prefetch_factor: int = 1,
     dataset_name: Optional[str] = None,
     local_name: Optional[str] = None,
 ) -> torch.utils.data.DataLoader:
@@ -327,6 +328,7 @@ def make_imagenet(
         shuffle: Shuffle the dataset.
         num_workers: Number of DataLoader workers.
         drop_last: Drop the last incomplete batch.
+        prefetch_factor: Number of batches to prefetch.
         dataset_name: Hugging Face dataset identifier.
         local_name: Folder name inside ``datasets/`` for caching.
 
@@ -362,6 +364,7 @@ def make_imagenet(
         pin_memory=pin_mem,
         num_workers=num_workers,
         persistent_workers=(num_workers > 0),
+        prefetch_factor=prefetch_factor,
     )
 
     logger.info(f"DataLoader created — {len(data_loader.dataset)} images ({local_name}, {split})")
@@ -455,6 +458,7 @@ def make_bdd(
     shuffle: bool = True,
     num_workers: int = 1,
     drop_last: bool = True,
+    prefetch_factor: int = 1,
 ) -> torch.utils.data.DataLoader:
     """Build a DataLoader for the local BDD layout.
 
@@ -477,6 +481,7 @@ def make_bdd(
         shuffle: Shuffle the dataset.
         num_workers: Number of DataLoader workers.
         drop_last: Drop the last incomplete batch.
+        prefetch_factor: Number of batches to prefetch.
 
     Returns:
         Configured ``torch.utils.data.DataLoader``.
@@ -503,6 +508,7 @@ def make_bdd(
         pin_memory=pin_mem,
         num_workers=num_workers,
         persistent_workers=(num_workers > 0),
+        prefetch_factor=prefetch_factor,
     )
 
     logger.info(f"DataLoader created — {len(data_loader.dataset)} images (bdd/{subset}, {split})")
