@@ -132,7 +132,7 @@ def run_finetune_epoch(
 ):
     """Run one full linear-probe fine-tuning epoch."""
     model.train(train)
-    if not full_tune: model.feature_extractor.eval()
+    if train and not full_tune: model.feature_extractor.eval()
 
     total_loss = torch.zeros(1, device=device)
     steps = 0
@@ -236,9 +236,9 @@ def trainer(
         target_encoder = copy.deepcopy(context_encoder)
         for p in target_encoder.parameters(): p.requires_grad_(False)
 
-        context_encoder = context_encoder.to(device)
-        predictor = predictor.to(device)
-        target_encoder = target_encoder.to(device)
+        context_encoder = torch.compile(context_encoder.to(device), dynamic=True)
+        predictor = torch.compile(predictor.to(device), dynamic=True)
+        target_encoder = torch.compile(target_encoder.to(device), dynamic=True)
 
         params = list(context_encoder.parameters()) + list(predictor.parameters())
     else:
@@ -252,7 +252,7 @@ def trainer(
         if not full_tune: 
             for p in model.feature_extractor.parameters(): p.requires_grad_(False)
 
-        model = model.to(device)
+        model = torch.compile(model.to(device), dynamic=True)
 
         params = filter(lambda p: p.requires_grad, model.parameters())
         
@@ -329,6 +329,7 @@ def trainer(
                 optimizer=optimizer,
                 lr_scheduler=lr_scheduler,
                 grad_accum_steps=grad_accum_steps,
+                full_tune=full_tune,
                 scaler=scaler,
             )
             val_loss = run_finetune_epoch(
@@ -458,6 +459,7 @@ def main():
             n_head=n_head,
             n_layers=12,
         )
+        
         # trainer(
         #     **trainer_cfg,
         #     model=vit,
@@ -465,6 +467,7 @@ def main():
         #     full_tune=False,
         #     run_name="target",
         # )
+        
         test_loader = make_imagenet(
             **data_loader_cfg,
             batch_size=2048,
@@ -472,7 +475,7 @@ def main():
             shuffle=False,
             drop_last=False,
         )
-        
+
         evaluate(vit, test_loader, "target_finetune", device)
         
 
