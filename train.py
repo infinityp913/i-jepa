@@ -105,13 +105,16 @@ def run_pretrain_epoch(
                     if lr_scheduler is not None: lr_scheduler.step()
 
                     with torch.no_grad():
-                        ema_weight = 1 - _cosine_anneal(
-                            step_offset + micro_step // grad_accum_steps - 1,
-                            total_steps - 1,
-                            ema_start,
-                            ema_end,
+                        torch._foreach_lerp_(
+                            list(target_encoder.parameters()),
+                            list(context_encoder.parameters()), 
+                            1 - _cosine_anneal(
+                                step_offset + micro_step // grad_accum_steps - 1,
+                                total_steps - 1,
+                                ema_start,
+                                ema_end,
+                            )
                         )
-                        torch._foreach_lerp_(list(target_encoder.parameters()), list(context_encoder.parameters()), ema_weight)
 
             total_loss += loss.detach()
             steps += 1
