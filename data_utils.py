@@ -339,10 +339,7 @@ def make_imagenet(
 
     split_dir = _DATASETS_DIR / local_name / split
 
-    if split_dir.is_dir():
-        hf_dataset = load_from_disk(split_dir)
-        
-        logger.info(f"Dataset loaded from disk — {len(hf_dataset)} images ({local_name}, {split})")
+    if split_dir.is_dir(): hf_dataset = load_from_disk(split_dir)
     else:
         if dataset_name is None: raise FileNotFoundError(f"No cached dataset at {split_dir}. Provide dataset_name to download it first.")
         
@@ -366,9 +363,9 @@ def make_imagenet(
         num_workers=num_workers,
         persistent_workers=(num_workers > 0),
     )
-    
-    logger.info("DataLoader created")
 
+    logger.info(f"DataLoader created — {len(data_loader.dataset)} images ({local_name}, {split})")
+    
     return data_loader
 
 Label = namedtuple("Label", ["name", "id", "color"])
@@ -508,7 +505,7 @@ def make_bdd(
         persistent_workers=(num_workers > 0),
     )
 
-    logger.info("DataLoader created")
+    logger.info(f"DataLoader created — {len(data_loader.dataset)} images (bdd/{subset}, {split})")
     
     return data_loader
 

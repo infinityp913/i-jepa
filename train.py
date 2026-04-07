@@ -2,6 +2,7 @@ import copy
 import csv
 import math
 import logging
+from itertools import islice
 from pathlib import Path
 import matplotlib.pyplot as plt
 import torch
@@ -10,8 +11,11 @@ from data_utils import MaskCollator, apply_masks, make_transforms, make_imagenet
 from models import Encoder, Predictor, Tokenizer, ViT
 from torch.nn.functional import smooth_l1_loss, mse_loss, cross_entropy
 import contextlib
+from torch.amp import autocast, GradScaler
 
 logger = logging.getLogger(__name__)
+
+AMP_DTYPE = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
 def _cosine_anneal(step, total_steps, start, end):
     """Cosine interpolation from start (step=0) to end (step=total_steps)."""
@@ -26,11 +30,13 @@ def run_pretrain_epoch(
     train=True,
     optimizer=None,
     lr_scheduler=None,
+    grad_accum_steps=1,
     ema_start=0.996,
     ema_end=1.0,
-    _tgt_stream=None,
     step_offset=0,
     total_steps=1,
+    _tgt_stream=None,
+    scaler=None,
 ):
     """Run one full I-JEPA pre-training epoch."""
     context_encoder.train(train)
@@ -40,11 +46,19 @@ def run_pretrain_epoch(
     total_loss = torch.zeros(1, device=device)
     steps = 0
     stream_ctx = torch.cuda.stream(_tgt_stream) if _tgt_stream else contextlib.nullcontext()
-    if train: opt_params = [p for group in optimizer.param_groups for p in group["params"]]
+
+    if train:
+        pbar_total = (len(loader) // grad_accum_steps) * grad_accum_steps
+        batch_iter = islice(loader, pbar_total)
+        micro_step = 0
+        opt_params = [p for group in optimizer.param_groups for p in group["params"]]
+        optimizer.zero_grad(set_to_none=True)
+    else:
+        pbar_total = len(loader)
+        batch_iter = loader
 
     with torch.set_grad_enabled(train):
-        pbar = tqdm(loader, desc="train" if train else "val", leave=False)
-        for (patches, _), enc_masks, pred_masks in pbar:
+        for (patches, _), enc_masks, pred_masks in tqdm(batch_iter, desc="train" if train else "val", leave=False, total=pbar_total):
             n_enc_masks, n_pred_masks = enc_masks.shape[0], pred_masks.shape[0]
 
             patches = patches.to(device, non_blocking=True)
@@ -53,36 +67,51 @@ def run_pretrain_epoch(
 
             if _tgt_stream: _tgt_stream.wait_stream(torch.cuda.current_stream())
 
-            with stream_ctx, torch.no_grad(): y_embed = apply_masks(target_encoder(patches), pred_masks).repeat(1, n_enc_masks, 1, 1).flatten(0, 1)
+            with autocast(device_type=device, dtype=AMP_DTYPE):
+                with stream_ctx, torch.no_grad(): 
+                    y_embed = apply_masks(
+                        target_encoder(patches), 
+                        pred_masks
+                    ).repeat(1, n_enc_masks, 1, 1).flatten(0, 1)
 
-            x_embed = context_encoder(
-                apply_masks(patches, enc_masks).flatten(0, 1),
-                enc_masks.flatten(0, 1)
-            )
+                x_embed = context_encoder(
+                    apply_masks(patches, enc_masks).flatten(0, 1),
+                    enc_masks.flatten(0, 1)
+                )
 
-            y_pred = predictor(
-                x_embed.repeat(n_pred_masks, 1, 1),
-                enc_masks.repeat(n_pred_masks, 1, 1).flatten(0, 1),
-                pred_masks.repeat(1, n_enc_masks, 1).flatten(0, 1),
-            )
+                y_pred = predictor(
+                    x_embed.repeat(n_pred_masks, 1, 1),
+                    enc_masks.repeat(n_pred_masks, 1, 1).flatten(0, 1),
+                    pred_masks.repeat(1, n_enc_masks, 1).flatten(0, 1),
+                )
 
-            if _tgt_stream: torch.cuda.current_stream().wait_stream(_tgt_stream)
+                if _tgt_stream: torch.cuda.current_stream().wait_stream(_tgt_stream)
 
-            loss = smooth_l1_loss(y_pred, y_embed)
-            #replace with loss from paper (below) if needed, the above loss is more stable
-            #loss = mse_loss(y_pred, y_embed, reduction='sum') / math.prod(pred_masks.shape[:-1])
+                loss = smooth_l1_loss(y_pred, y_embed)
+                #replace with loss from paper (below) if needed, the above loss is more stable
+                #loss = mse_loss(y_pred, y_embed, reduction='sum') / y_embed.shape[0]
 
             if train:
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(opt_params, max_norm=1.0)
-                optimizer.step()
-                if lr_scheduler is not None: lr_scheduler.step()
+                scaler.scale(loss / grad_accum_steps).backward()
+                micro_step += 1
 
-                ema_weight = 1 - _cosine_anneal(step_offset + steps, total_steps - 1, ema_start, ema_end)
-                with torch.no_grad():
-                    for p_ctx, p_tgt in zip(context_encoder.parameters(), target_encoder.parameters()):
-                        p_tgt.lerp_(p_ctx, ema_weight)
+                if micro_step % grad_accum_steps == 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(opt_params, max_norm=1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad(set_to_none=True)
+
+                    if lr_scheduler is not None: lr_scheduler.step()
+
+                    with torch.no_grad():
+                        ema_weight = 1 - _cosine_anneal(
+                            step_offset + micro_step // grad_accum_steps - 1,
+                            total_steps - 1,
+                            ema_start,
+                            ema_end,
+                        )
+                        for p_ctx, p_tgt in zip(context_encoder.parameters(), target_encoder.parameters()): p_tgt.lerp_(p_ctx, ema_weight)
 
             total_loss += loss.detach()
             steps += 1
@@ -97,7 +126,9 @@ def run_finetune_epoch(
     train=True,
     optimizer=None,
     lr_scheduler=None,
+    grad_accum_steps=1,
     full_tune=False,
+    scaler=None,
 ):
     """Run one full linear-probe fine-tuning epoch."""
     model.train(train)
@@ -105,19 +136,36 @@ def run_finetune_epoch(
 
     total_loss = torch.zeros(1, device=device)
     steps = 0
-    if train: opt_params = [p for group in optimizer.param_groups for p in group["params"]]
+
+    if train:
+        pbar_total = (len(loader) // grad_accum_steps) * grad_accum_steps
+        batch_iter = islice(loader, pbar_total)
+        micro_step = 0
+        opt_params = [p for group in optimizer.param_groups for p in group["params"]]
+        optimizer.zero_grad(set_to_none=True)
+    else:
+        batch_iter = loader
+        pbar_total = len(loader)
 
     with torch.set_grad_enabled(train):
-        pbar = tqdm(loader, desc="train" if train else "val", leave=False)
-        for patches, labels in pbar:
-            loss = cross_entropy(model(patches.to(device, non_blocking=True)), labels.to(device, non_blocking=True))
+        for patches, labels in tqdm(batch_iter, desc="train" if train else "val", leave=False, total=pbar_total):
+            patches = patches.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+
+            with autocast(device_type=device, dtype=AMP_DTYPE): loss = cross_entropy(model(patches), labels)
 
             if train:
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(opt_params, max_norm=1.0)
-                optimizer.step()
-                if lr_scheduler is not None: lr_scheduler.step()
+                scaler.scale(loss / grad_accum_steps).backward()
+                micro_step += 1
+
+                if micro_step % grad_accum_steps == 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(opt_params, max_norm=1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad(set_to_none=True)
+
+                    if lr_scheduler is not None: lr_scheduler.step()
 
             total_loss += loss.detach()
             steps += 1
@@ -139,10 +187,13 @@ def evaluate(model, loader, run_name=None, device="cpu"):
     model = model.to(device).eval()
     correct_tensor = torch.zeros(1, dtype=torch.long, device=device)
     total = 0
+    
     with torch.inference_mode():
-        for patches, labels in tqdm(loader, desc="eval", leave=False):
-            correct_tensor += (model(patches.to(device, non_blocking=True)).argmax(dim=-1) == labels.to(device, non_blocking=True)).sum()
-            total += labels.size(0)
+        with autocast(device_type=device, dtype=AMP_DTYPE):
+            for patches, labels in tqdm(loader, desc="eval", leave=False):
+                correct_tensor += (model(patches.to(device, non_blocking=True)).argmax(dim=-1) == labels.to(device, non_blocking=True)).sum()
+                total += labels.size(0)
+    
     accuracy = correct_tensor.item() / total
     logger.info(f"accuracy={accuracy:.4f} ({correct_tensor.item()}/{total})")
     return accuracy
@@ -164,12 +215,22 @@ def trainer(
     lr=1e-3,
     weight_decay=0.05,
     epochs=100,
+    grad_accum_steps=1,
     warmup_ratio=0.05,
     min_lr_ratio=0.1,
     device="cpu",
     run_name="model",
 ):
-    logger.info(f"Task: {task} | device: {device}")
+    n_full = len(train_loader)
+    if n_full < grad_accum_steps: raise ValueError(f"len(train_loader)={n_full} must be >= grad_accum_steps={grad_accum_steps}")
+    dropped = n_full % grad_accum_steps
+    opt_steps_per_epoch = n_full // grad_accum_steps
+    if dropped: logger.warning(f"Each train epoch skips the last {dropped} batches (incomplete gradient accumulation).")
+
+    logger.info(
+        f"Task: {task} | device: {device} | grad_accum_steps={grad_accum_steps} "
+        f"({opt_steps_per_epoch} optimizer steps / epoch)"
+    )
 
     if task == "pretrain":
         target_encoder = copy.deepcopy(context_encoder)
@@ -203,8 +264,7 @@ def trainer(
         fused=True
     )
 
-    steps_per_epoch = len(train_loader)
-    total_steps = epochs * steps_per_epoch
+    total_steps = epochs * opt_steps_per_epoch
     warmup_steps = int(total_steps * warmup_ratio)
     lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer,
@@ -221,10 +281,11 @@ def trainer(
     with open(loss_csv, "w", newline="") as f: csv.writer(f).writerow(csv_header)
 
     best_val = float("inf")
-    global_step = 0
+    global_opt_step = 0
     train_losses, val_losses = [], []
 
     if task == "pretrain": _tgt_stream = torch.cuda.Stream(device) if device != "cpu" else None
+    scaler = GradScaler(device, enabled=(AMP_DTYPE == torch.float16))
 
     for epoch in tqdm(range(1, epochs + 1), desc="epochs"):
         if task == "pretrain":
@@ -237,14 +298,16 @@ def trainer(
                 train=True,
                 optimizer=optimizer,
                 lr_scheduler=lr_scheduler,
+                grad_accum_steps=grad_accum_steps,
                 ema_start=ema_decay_start,
                 ema_end=ema_decay_end,
-                _tgt_stream=_tgt_stream,
-                step_offset=global_step,
+                step_offset=global_opt_step,
                 total_steps=total_steps,
+                _tgt_stream=_tgt_stream,
+                scaler=scaler,
             )
 
-            global_step += steps_per_epoch
+            global_opt_step += opt_steps_per_epoch
 
             val_loss = run_pretrain_epoch(
                 context_encoder,
@@ -254,6 +317,7 @@ def trainer(
                 device,
                 train=False,
                 _tgt_stream=_tgt_stream,
+                scaler=scaler,
             )
 
         else:
@@ -264,12 +328,15 @@ def trainer(
                 train=True,
                 optimizer=optimizer,
                 lr_scheduler=lr_scheduler,
+                grad_accum_steps=grad_accum_steps,
+                scaler=scaler,
             )
             val_loss = run_finetune_epoch(
                 model,
                 val_loader,
                 device,
                 train=False,
+                scaler=scaler,
             )
 
         if val_loss < best_val:
@@ -308,8 +375,9 @@ def trainer(
 
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logger.info(f"AMP_DTYPE: {AMP_DTYPE}")
 
-    TASK = "pretrain"
+    TASK = "finetune"
 
     patch_size = 16
     encoder_dim = 768
@@ -329,7 +397,7 @@ def main():
 
     train_loader = make_imagenet(
         **data_loader_cfg,
-        batch_size=64,
+        batch_size=128,
         split="train",
         shuffle=True,
         drop_last=True,
@@ -348,9 +416,10 @@ def main():
         train_loader=train_loader,
         val_loader=val_loader,
         task=TASK,
-        lr=1.5e-4,
+        lr=1e-3,
         weight_decay=0.05,
-        epochs=100,
+        epochs=20,
+        grad_accum_steps=4,
         warmup_ratio=0.1,
         min_lr_ratio=1e-4,
         device=device,
@@ -381,13 +450,6 @@ def main():
             run_name="imagenet",
         )
     else:
-        test_loader = make_imagenet(
-            **data_loader_cfg,
-            batch_size=256,
-            split="test",
-            shuffle=False,
-            drop_last=False,
-        )
         vit = ViT(
             num_patches=num_patches,
             num_classes=100,
@@ -403,7 +465,15 @@ def main():
         #     full_tune=False,
         #     run_name="target",
         # )
-        evaluate(vit, test_loader, "context_finetune", device)
+        test_loader = make_imagenet(
+            **data_loader_cfg,
+            batch_size=2048,
+            split="test",
+            shuffle=False,
+            drop_last=False,
+        )
+        
+        evaluate(vit, test_loader, "target_finetune", device)
         
 
 if __name__ == "__main__": main()
