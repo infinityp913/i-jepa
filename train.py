@@ -236,9 +236,9 @@ def trainer(
         target_encoder = copy.deepcopy(context_encoder)
         for p in target_encoder.parameters(): p.requires_grad_(False)
 
-        context_encoder = torch.compile(context_encoder.to(device), backend="aot_eager")
-        predictor = torch.compile(predictor.to(device), backend="aot_eager")
-        target_encoder = torch.compile(target_encoder.to(device), backend="aot_eager")
+        context_encoder = context_encoder.to(device)
+        predictor = predictor.to(device)
+        target_encoder = target_encoder.to(device)
 
         params = list(context_encoder.parameters()) + list(predictor.parameters())
     else:
@@ -252,16 +252,15 @@ def trainer(
         if not full_tune: 
             for p in model.feature_extractor.parameters(): p.requires_grad_(False)
 
-        model = torch.compile(model.to(device), backend="aot_eager")
+        model = model.to(device)
 
         params = filter(lambda p: p.requires_grad, model.parameters())
         
 
-    optimizer = torch.optim.AdamW(
+    optimizer = torch.optim.Muon(
         params,
         lr=lr,
         weight_decay=weight_decay,
-        fused=True
     )
 
     total_steps = epochs * opt_steps_per_epoch
