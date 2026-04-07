@@ -257,10 +257,11 @@ def trainer(
         params = filter(lambda p: p.requires_grad, model.parameters())
         
 
-    optimizer = torch.optim.Muon(
+    optimizer = torch.optim.AdamW(
         params,
         lr=lr,
         weight_decay=weight_decay,
+        fused=True
     )
 
     total_steps = epochs * opt_steps_per_epoch
