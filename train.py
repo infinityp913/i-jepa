@@ -12,10 +12,77 @@ from models import Encoder, Predictor, Tokenizer, ViT
 from torch.nn.functional import smooth_l1_loss, mse_loss, cross_entropy
 import contextlib
 from torch.amp import autocast, GradScaler
+import time
+from typing import Any, Callable, Dict, Type
+from pydantic import BaseModel, ConfigDict
 
 logger = logging.getLogger(__name__)
 
 AMP_DTYPE = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
+class OptimizerGroup:
+    """Wraps multiple optimizers to present a single optimizer-like interface."""
+
+    def __init__(self, *optimizers, lr_lambda=None):
+        self.optimizers = optimizers
+        self.param_groups = [g for opt in optimizers for g in opt.param_groups]
+        self._schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda) for opt in self.optimizers] if lr_lambda else None
+
+    def zero_grad(self, set_to_none=False):
+        for opt in self.optimizers: opt.zero_grad(set_to_none=set_to_none)
+
+    def step(self):
+        for opt in self.optimizers: opt.step()
+
+    def scaler_unscale_(self, scaler):
+        for opt in self.optimizers: scaler.unscale_(opt)
+
+    def scaler_step(self, scaler):
+        for opt in self.optimizers: scaler.step(opt)
+
+    def state_dict(self):
+        return [opt.state_dict() for opt in self.optimizers]
+
+    def load_state_dict(self, state_dicts):
+        for opt, sd in zip(self.optimizers, state_dicts): opt.load_state_dict(sd)
+
+    def step_schedulers(self):
+        if self._schedulers: 
+            for s in self._schedulers: s.step()
+
+class OptimizerConfig(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    
+    optimizer_class: Type[torch.optim.Optimizer]
+    selector: Callable[[torch.nn.Parameter], bool] = lambda p: True
+    kwargs: Dict[str, Any] = {}
+
+def make_optimizer(params, configs: list[OptimizerConfig], lr_lambda=None):
+    """
+    Grouped optimizer builder.
+    
+    Args:
+        params: Iterable of PyTorch parameters.
+        configs: List of OptimizerConfig models.
+        lr_lambda: Optional learning rate scheduler lambda.
+    """
+    assigned = set()
+    grouped_params = [[] for _ in configs]
+
+    for p in params:
+        for i, cfg in enumerate(configs):
+            if cfg.selector(p) and id(p) not in assigned:
+                grouped_params[i].append(p)
+                assigned.add(id(p))
+                break
+
+    optimizers = []
+    for i, cfg in enumerate(configs):
+        opt_params = grouped_params[i]
+        if opt_params:
+            optimizers.append(cfg.optimizer_class(opt_params, **cfg.kwargs))
+
+    return OptimizerGroup(*optimizers, lr_lambda=lr_lambda)
 
 def _cosine_anneal(step, total_steps, start, end):
     """Cosine interpolation from start (step=0) to end (step=total_steps)."""
@@ -29,7 +96,6 @@ def run_pretrain_epoch(
     device="cpu",
     train=True,
     optimizer=None,
-    lr_scheduler=None,
     grad_accum_steps=1,
     ema_start=0.996,
     ema_end=1.0,
@@ -37,6 +103,7 @@ def run_pretrain_epoch(
     total_steps=1,
     _tgt_stream=None,
     scaler=None,
+    profile=False,
 ):
     """Run one full I-JEPA pre-training epoch."""
     context_encoder.train(train)
@@ -57,6 +124,8 @@ def run_pretrain_epoch(
         pbar_total = len(loader)
         batch_iter = loader
 
+    if profile: _ep_start = time.perf_counter()
+
     with torch.set_grad_enabled(train):
         for (patches, _), enc_masks, pred_masks in tqdm(batch_iter, desc="train" if train else "val", leave=False, total=pbar_total):
             n_enc_masks, n_pred_masks = enc_masks.shape[0], pred_masks.shape[0]
@@ -73,7 +142,7 @@ def run_pretrain_epoch(
                         target_encoder(patches), 
                         pred_masks
                     ).repeat(1, n_enc_masks, 1, 1).flatten(0, 1)
-
+                
                 x_embed = context_encoder(
                     apply_masks(patches, enc_masks).flatten(0, 1),
                     enc_masks.flatten(0, 1)
@@ -96,13 +165,13 @@ def run_pretrain_epoch(
                 micro_step += 1
 
                 if micro_step % grad_accum_steps == 0:
-                    scaler.unscale_(optimizer)
+                    optimizer.scaler_unscale_(scaler)
                     torch.nn.utils.clip_grad_norm_(opt_params, max_norm=1.0)
-                    scaler.step(optimizer)
+                    optimizer.scaler_step(scaler)
                     scaler.update()
                     optimizer.zero_grad(set_to_none=True)
 
-                    if lr_scheduler is not None: lr_scheduler.step()
+                    optimizer.step_schedulers()
 
                     with torch.no_grad():
                         ema_weight = 1 - _cosine_anneal(
@@ -116,6 +185,10 @@ def run_pretrain_epoch(
             total_loss += loss.detach()
             steps += 1
 
+    torch.cuda.empty_cache()
+
+    if profile: logger.info(f"  pretrain epoch ({'train' if train else 'val'}) took {time.perf_counter() - _ep_start:.2f}s")
+    
     return (total_loss / steps).item()
 
 
@@ -125,10 +198,10 @@ def run_finetune_epoch(
     device="cpu",
     train=True,
     optimizer=None,
-    lr_scheduler=None,
     grad_accum_steps=1,
     full_tune=False,
     scaler=None,
+    profile=False,
 ):
     """Run one full linear-probe fine-tuning epoch."""
     model.train(train)
@@ -146,6 +219,8 @@ def run_finetune_epoch(
     else:
         batch_iter = loader
         pbar_total = len(loader)
+    
+    if profile: _ep_start = time.perf_counter()
 
     with torch.set_grad_enabled(train):
         for patches, labels in tqdm(batch_iter, desc="train" if train else "val", leave=False, total=pbar_total):
@@ -159,16 +234,20 @@ def run_finetune_epoch(
                 micro_step += 1
 
                 if micro_step % grad_accum_steps == 0:
-                    scaler.unscale_(optimizer)
+                    optimizer.scaler_unscale_(scaler)
                     torch.nn.utils.clip_grad_norm_(opt_params, max_norm=1.0)
-                    scaler.step(optimizer)
+                    optimizer.scaler_step(scaler)
                     scaler.update()
                     optimizer.zero_grad(set_to_none=True)
 
-                    if lr_scheduler is not None: lr_scheduler.step()
+                    optimizer.step_schedulers()
 
             total_loss += loss.detach()
             steps += 1
+    
+    torch.cuda.empty_cache()
+
+    if profile: logger.info(f"  finetune epoch ({'train' if train else 'val'}) took {time.perf_counter() - _ep_start:.2f}s")
 
     return (total_loss / steps).item()
 
@@ -201,6 +280,7 @@ def evaluate(model, loader, run_name=None, device="cpu"):
 def trainer(
     train_loader,
     val_loader,
+    optimizer_configs,
     task="pretrain",
     # pretrain-only
     context_encoder=None,
@@ -212,14 +292,13 @@ def trainer(
     pretrain_checkpoint=None,
     full_tune=False,
     # shared
-    lr=1e-3,
-    weight_decay=0.05,
     epochs=100,
     grad_accum_steps=1,
     warmup_ratio=0.05,
     min_lr_ratio=0.1,
     device="cpu",
     run_name="model",
+    profile=False,
 ):
     n_full = len(train_loader)
     if n_full < grad_accum_steps: raise ValueError(f"len(train_loader)={n_full} must be >= grad_accum_steps={grad_accum_steps}")
@@ -236,9 +315,9 @@ def trainer(
         target_encoder = copy.deepcopy(context_encoder)
         for p in target_encoder.parameters(): p.requires_grad_(False)
 
-        context_encoder = torch.compile(context_encoder.to(device), backend="aot_eager")
-        predictor = torch.compile(predictor.to(device), backend="aot_eager")
-        target_encoder = torch.compile(target_encoder.to(device), backend="aot_eager")
+        context_encoder = context_encoder.to(device)
+        predictor = predictor.to(device)
+        target_encoder = target_encoder.to(device)
 
         params = list(context_encoder.parameters()) + list(predictor.parameters())
     else:
@@ -252,25 +331,22 @@ def trainer(
         if not full_tune: 
             for p in model.feature_extractor.parameters(): p.requires_grad_(False)
 
-        model = torch.compile(model.to(device), backend="aot_eager")
+        model = model.to(device)
 
-        params = filter(lambda p: p.requires_grad, model.parameters())
+        params = list(filter(lambda p: p.requires_grad, model.parameters()))
         
-
-    optimizer = torch.optim.AdamW(
-        params,
-        lr=lr,
-        weight_decay=weight_decay,
-        fused=True
-    )
+    logger.info(f"Total trainable parameters: {sum(p.numel() for p in params):,}")
 
     total_steps = epochs * opt_steps_per_epoch
     warmup_steps = int(total_steps * warmup_ratio)
-    lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer,
-        lambda step: ((step + 1) / warmup_steps) if step < warmup_steps 
-        else _cosine_anneal(step - warmup_steps, total_steps - warmup_steps - 1, 1.0, min_lr_ratio)
+    lr_lambda = lambda step: ((step + 1) / warmup_steps) if step < warmup_steps else _cosine_anneal(step - warmup_steps, total_steps - warmup_steps - 1, 1.0, min_lr_ratio)
+
+    optimizer = make_optimizer(
+        params,
+        optimizer_configs,
+        lr_lambda=lr_lambda,
     )
+
     logger.info(f"total_steps={total_steps}, warmup_steps={warmup_steps}")
 
     save_path = Path("checkpoints") / f"{run_name}_{task}"
@@ -297,7 +373,6 @@ def trainer(
                 device,
                 train=True,
                 optimizer=optimizer,
-                lr_scheduler=lr_scheduler,
                 grad_accum_steps=grad_accum_steps,
                 ema_start=ema_decay_start,
                 ema_end=ema_decay_end,
@@ -305,6 +380,7 @@ def trainer(
                 total_steps=total_steps,
                 _tgt_stream=_tgt_stream,
                 scaler=scaler,
+                profile=profile,
             )
 
             global_opt_step += opt_steps_per_epoch
@@ -318,6 +394,7 @@ def trainer(
                 train=False,
                 _tgt_stream=_tgt_stream,
                 scaler=scaler,
+                profile=profile,
             )
 
         else:
@@ -327,10 +404,10 @@ def trainer(
                 device,
                 train=True,
                 optimizer=optimizer,
-                lr_scheduler=lr_scheduler,
                 grad_accum_steps=grad_accum_steps,
                 full_tune=full_tune,
                 scaler=scaler,
+                profile=profile,
             )
             val_loss = run_finetune_epoch(
                 model,
@@ -338,6 +415,7 @@ def trainer(
                 device,
                 train=False,
                 scaler=scaler,
+                profile=profile,
             )
 
         if val_loss < best_val:
@@ -377,65 +455,80 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     logger.info(f"AMP_DTYPE: {AMP_DTYPE}")
 
-    TASK = "finetune"
+    TASK = "pretrain"
 
     patch_size = 16
-    encoder_dim = 768
-    predictor_dim = 384
-    n_head = 8
-    num_patches = math.prod(IMAGENET_SIZE) // patch_size ** 2
+    encoder_dim = 384
+    predictor_dim = 192
+    n_head = 12
 
-    tokenizer = Tokenizer(IMAGENET_SIZE, patch_size)
+    tokenizer = Tokenizer(BDD_SIZE, patch_size)
 
     data_loader_cfg = dict(
-        local_name="mini-imagenet",
-        transform=make_transforms(crop_size=IMAGENET_SIZE, normalization=IMAGENET_NORMALIZATION),
-        collator=MaskCollator(input_size=IMAGENET_SIZE, patch_size=patch_size) if TASK == "pretrain" else None,
+        mode=TASK,
+        transform=make_transforms(normalization=BDD_NORMALIZATION),
+        collator=MaskCollator(input_size=BDD_SIZE, patch_size=patch_size) if TASK == "pretrain" else None,
         patcher=tokenizer.encode,
-        num_workers=2,
+        num_workers=16,
         prefetch_factor=2,
     )
 
-    train_loader = make_imagenet(
+    train_loader = make_bdd(
         **data_loader_cfg,
-        batch_size=128,
+        batch_size=8,
         split="train",
         shuffle=True,
         drop_last=True,
     )
-    val_loader = make_imagenet(
+    val_loader = make_bdd(
         **data_loader_cfg,
-        batch_size=128,
+        batch_size=8,
         split="validation",
         shuffle=False,
         drop_last=False,
     )
+
+    lr = 1.5e-4
+    weight_decay = 0.05
+    optimizer_configs = [
+        OptimizerConfig(
+            optimizer_class=torch.optim.Muon,
+            selector=lambda p: p.ndim >= 2,
+            kwargs={"lr": lr, "weight_decay": weight_decay}
+        ),
+        OptimizerConfig(
+            optimizer_class=torch.optim.AdamW,
+            selector=lambda p: True,
+            kwargs={"lr": lr, "weight_decay": weight_decay}
+        )
+    ]
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     trainer_cfg = dict(
         train_loader=train_loader,
         val_loader=val_loader,
+        optimizer_configs=optimizer_configs,
         task=TASK,
-        lr=1e-3,
-        weight_decay=0.05,
-        epochs=20,
-        grad_accum_steps=4,
+        epochs=100,
+        grad_accum_steps=128,
         warmup_ratio=0.1,
         min_lr_ratio=1e-4,
         device=device,
+        profile=False,
     )
 
     if TASK == "pretrain":
         context_encoder = Encoder(
-            num_patches=num_patches,
+            img_size=BDD_SIZE,
             patch_size=patch_size,
             d_model=encoder_dim,
             n_head=n_head,
             n_layers=12,
         )
         predictor = Predictor(
-            num_patches=num_patches,
+            img_size=BDD_SIZE,
+            patch_size=patch_size,
             embed_dim=encoder_dim,
             d_model=predictor_dim,
             n_head=n_head,
@@ -448,11 +541,11 @@ def main():
             predictor=predictor,
             ema_decay_start=0.996,
             ema_decay_end=1.0,
-            run_name="imagenet",
+            run_name="bdd",
         )
     else:
         vit = ViT(
-            num_patches=num_patches,
+            img_size=BDD_SIZE,
             num_classes=100,
             patch_size=patch_size,
             d_model=encoder_dim,
@@ -460,15 +553,15 @@ def main():
             n_layers=12,
         )
         
-        # trainer(
-        #     **trainer_cfg,
-        #     model=vit,
-        #     pretrain_checkpoint="pretrain",
-        #     full_tune=False,
-        #     run_name="target",
-        # )
+        trainer(
+            **trainer_cfg,
+            model=vit,
+            pretrain_checkpoint="bdd_pretrain",
+            full_tune=False,
+            run_name="target",
+        )
         
-        test_loader = make_imagenet(
+        test_loader = make_bdd(
             **data_loader_cfg,
             batch_size=2048,
             split="test",
@@ -478,5 +571,4 @@ def main():
 
         evaluate(vit, test_loader, "target_finetune", device)
         
-
 if __name__ == "__main__": main()

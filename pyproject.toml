@@ -8,6 +8,8 @@ dependencies = [
     "torchvision==0.24.1",
     "matplotlib",
     "tqdm>=4.0",
+    "flash-attn",
+    "accelerate",
 ]
 
 [project.optional-dependencies]
