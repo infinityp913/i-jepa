@@ -39,7 +39,7 @@ class Tokenizer(nn.Module):
         """
         return self.fold(x.transpose(-2, -1))
 
-def _precompute_dataset_rope(img_size, patch_size, head_dim, base=10_000.0):
+def _precompute_rope_embeddings(img_size, patch_size, head_dim, base=10_000.0):
     """Computes static 2D RoPE."""
     dim = head_dim // 2
 
@@ -128,7 +128,7 @@ class Encoder(nn.Module):
         super().__init__()        
         self.embed = nn.Linear(patch_size ** 2 * img_channels, d_model, bias=False)
 
-        cos, sin = _precompute_dataset_rope(img_size, patch_size, d_model // n_head)
+        cos, sin = _precompute_rope_embeddings(img_size, patch_size, d_model // n_head)
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
 
@@ -180,7 +180,7 @@ class Predictor(nn.Module):
         self.mask_token = nn.Parameter(torch.zeros(d_model))
         nn.init.trunc_normal_(self.mask_token, std=0.02)
 
-        cos, sin = _precompute_dataset_rope(img_size, patch_size, d_model // n_head)
+        cos, sin = _precompute_rope_embeddings(img_size, patch_size, d_model // n_head)
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
 
