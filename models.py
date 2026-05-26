@@ -151,8 +151,9 @@ class Encoder(nn.Module):
         cos = self.cos[masks]
         sin = self.sin[masks]
         if masks is None:
-            cos = cos.expand(len(x), -1, -1)
-            sin = sin.expand(len(x), -1, -1)
+            broadcast_shape = (len(x), -1, -1)
+            cos = cos.expand(*broadcast_shape)
+            sin = sin.expand(*broadcast_shape)
 
         for block in self.transformer_blocks: tokens = block(tokens, cos, sin)
 
