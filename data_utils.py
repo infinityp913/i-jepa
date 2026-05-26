@@ -7,8 +7,8 @@ from typing import Any, Callable, List, Optional, Tuple, Union
 import numpy as np
 import torch
 import torchvision.transforms as transforms
+import torchvision.io as tvio
 from datasets import load_dataset, load_from_disk
-from PIL import Image
 
 
 logger = logging.getLogger(__name__)
@@ -38,7 +38,7 @@ def make_transforms(
 
     return transforms.Compose(
         ([transforms.RandomResizedCrop(crop_size, scale=crop_scale)] if crop_size else [])
-        + [transforms.ToTensor(), transforms.Normalize(*normalization)]
+        + [transforms.ConvertImageDtype(torch.float32), transforms.Normalize(*normalization)]
     )
 
 class MaskCollator:
@@ -293,7 +293,7 @@ class ImageNetDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
         example = self.hf_dataset[idx]
-        img = self.transform(example["image"].convert("RGB"))
+        img = self.transform(transforms.functional.pil_to_tensor(example["image"].convert("RGB")))
         return (
             self.patcher(img.unsqueeze(0)).squeeze(0) if self.patcher else img,
             example["label"]
@@ -438,10 +438,10 @@ class BDDDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, Union[torch.Tensor, int]]:
         img_path = self.image_paths[idx]
-        with Image.open(img_path) as im: img = self.transform(im.convert("RGB"))
+        img = self.transform(tvio.read_image(str(img_path), mode=tvio.ImageReadMode.RGB))
         label = -1
         if self.labels_dir:
-            with Image.open(self.labels_dir / f"{img_path.stem}_train_id.png") as lbl: label = torch.from_numpy(np.array(lbl, dtype=np.uint8)).long()
+            label = tvio.read_image(str(self.labels_dir / f"{img_path.stem}_train_id.png"), mode=tvio.ImageReadMode.GRAY).squeeze(0).long()
         return (
             self.patcher(img.unsqueeze(0)).squeeze(0) if self.patcher else img,
             label
