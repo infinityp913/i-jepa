@@ -110,31 +110,64 @@ class TransformerBlock(nn.Module):
 
         return x + self.ffn(x)
 
+class ViT(nn.Module):
+    """A Vision Transformer handling RoPE, attention blocks, and normalization."""
+
+    def __init__(self, img_size, patch_size, d_model, n_head, n_layers):
+        """
+        Initializes the ViT.
+
+        Args:
+            img_size (tuple[int, int]): Spatial resolution (H, W) of the input image.
+            patch_size (int): Square patch size.
+            d_model (int): Vision Transformer dimension.
+            n_head (int): Number of attention heads.
+            n_layers (int): Number of Vision Transformer blocks.
+        """
+        super().__init__()
+        
+        cos, sin = _precompute_rope_embeddings(img_size, patch_size, d_model // n_head)
+        self.register_buffer("cos", cos, persistent=False)
+        self.register_buffer("sin", sin, persistent=False)
+        
+        self.transformer_blocks = nn.ModuleList([TransformerBlock(d_model, n_head) for _ in range(n_layers)])
+        
+        self.norm = nn.RMSNorm(d_model)
+
+    def forward(self, tokens, cos, sin):
+        """
+        Forward pass of the ViT.
+
+        Args:
+            tokens (torch.Tensor): Input sequence embeddings [B, N, d_model].
+            cos (torch.Tensor): Pre-sliced cosine frequencies for RoPE.
+            sin (torch.Tensor): Pre-sliced sine frequencies for RoPE.
+        Returns:
+            torch.Tensor: Normalized output embeddings [B, N, d_model].
+        """
+        for block in self.transformer_blocks: tokens = block(tokens, cos, sin)
+            
+        return self.norm(tokens)
+
 class Encoder(nn.Module):
     """A Transformer based encoder for encoding images into patch-level embeddings."""
 
-    def __init__(self, img_size, patch_size=16, img_channels=3, d_model=768, n_head=12, n_layers=12):
+    def __init__(self, img_size, patch_size=16, in_channels=3, d_model=768, n_head=12, n_layers=12):
         """
         Initializes the Encoder.
 
         Args:
             img_size (tuple[int, int]): Spatial resolution (H, W) of the input image.
             patch_size (int): Square patch size (paper default: 16).
-            img_channels (int): Number of input image channels (default: 3 for RGB).
+            in_channels (int): Number of input image channels (default: 3 for RGB).
             d_model (int): Encoder dimensions (paper default: 768).
             n_head (int): Number of attention heads (paper default: 12).
             n_layers (int): Number of Transformer encoder blocks (paper default: 12).
         """
-        super().__init__()        
-        self.embed = nn.Linear(patch_size ** 2 * img_channels, d_model, bias=False)
-
-        cos, sin = _precompute_rope_embeddings(img_size, patch_size, d_model // n_head)
-        self.register_buffer("cos", cos, persistent=False)
-        self.register_buffer("sin", sin, persistent=False)
-
-        self.transformer_blocks = nn.ModuleList([TransformerBlock(d_model, n_head) for _ in range(n_layers)])
-
-        self.norm = nn.RMSNorm(d_model)
+        super().__init__()
+        self.embed = nn.Linear(patch_size ** 2 * in_channels, d_model, bias=False)
+        
+        self.core = ViT(img_size, patch_size, d_model, n_head, n_layers)
 
     def forward(self, x, masks=None):
         """
@@ -146,49 +179,39 @@ class Encoder(nn.Module):
         Returns:
             torch.Tensor: Embeddings of kept patches [B, n_context, d_model].
         """
-        tokens = self.embed(x)
-
-        cos = self.cos[masks]
-        sin = self.sin[masks]
+        cos = self.core.cos[masks]
+        sin = self.core.sin[masks]
         if masks is None:
             broadcast_shape = (len(x), -1, -1)
             cos = cos.expand(*broadcast_shape)
             sin = sin.expand(*broadcast_shape)
 
-        for block in self.transformer_blocks: tokens = block(tokens, cos, sin)
-
-        return self.norm(tokens)
+        return self.core(self.embed(x), cos, sin)
 
 class Predictor(nn.Module):
     """A Transformer based predictor for predicting the masked patches."""
 
-    def __init__(self, img_size, patch_size=16, embed_dim=768, d_model=384, n_head=12, n_layers=6):
+    def __init__(self, img_size, patch_size=16, in_channels=768, d_model=384, n_head=12, n_layers=6):
         """
         Initializes the Predictor.
 
         Args:
             img_size (tuple[int, int]): Spatial resolution (H, W) of the input image.
             patch_size (int): Square patch size (paper default: 16).
-            embed_dim (int): Encoder dimension (paper default: 768).
+            in_channels (int): Encoder dimension (paper default: 768).
             d_model (int): Predictor dimension (paper default: 384).
             n_head (int): Number of attention heads.
             n_layers (int): Number of Transformer blocks (paper uses a narrower/shallower predictor).
         """
         super().__init__()
-        self.embed = nn.Linear(embed_dim, d_model, bias=False)
+        self.embed = nn.Linear(in_channels, d_model, bias=False)
 
         self.mask_token = nn.Parameter(torch.zeros(d_model))
         nn.init.trunc_normal_(self.mask_token, std=0.02)
 
-        cos, sin = _precompute_rope_embeddings(img_size, patch_size, d_model // n_head)
-        self.register_buffer("cos", cos, persistent=False)
-        self.register_buffer("sin", sin, persistent=False)
+        self.core = ViT(img_size, patch_size, d_model, n_head, n_layers)
 
-        self.transformer_blocks = nn.ModuleList([TransformerBlock(d_model, n_head) for _ in range(n_layers)])
-
-        self.norm = nn.RMSNorm(d_model)
-
-        self.proj = nn.Linear(d_model, embed_dim, bias=False)
+        self.proj = nn.Linear(d_model, in_channels, bias=False)
 
     def forward(self, x, x_masks, y_masks):
         """
@@ -201,21 +224,18 @@ class Predictor(nn.Module):
         Returns:
             torch.Tensor: Predicted embeddings at target positions [B, n_target, embed_dim].
         """
-        tokens = torch.cat([self.embed(x), self.mask_token.expand(*y_masks.shape, -1)], dim=1)
+        return self.proj(self.core(
+            torch.cat([self.embed(x), self.mask_token.expand(*y_masks.shape, -1)], dim=1),
+            torch.cat([self.core.cos[x_masks], self.core.cos[y_masks]], dim=1),
+            torch.cat([self.core.sin[x_masks], self.core.sin[y_masks]], dim=1)
+        )[:, x_masks.shape[1]:])
 
-        cos = torch.cat([self.cos[x_masks], self.cos[y_masks]], dim=1)
-        sin = torch.cat([self.sin[x_masks], self.sin[y_masks]], dim=1)
+class ImageClassifier(nn.Module):
+    """A Vision Transformer based image classifier."""
 
-        for block in self.transformer_blocks: tokens = block(tokens, cos, sin)
-
-        return self.proj(self.norm(tokens[:, x_masks.shape[1]:]))
-
-class ViT(nn.Module):
-    """A Vision Transformer model for classification."""
-
-    def __init__(self, img_size, num_classes, patch_size=16, img_channels=3, d_model=768, n_head=12, n_layers=12):
+    def __init__(self, img_size, num_classes, patch_size=16, in_channels=3, d_model=768, n_head=12, n_layers=12):
         """
-        Initializes the ViT.
+        Initializes the ImageClassifier.
 
         Args:
             img_size (tuple[int, int]): Spatial resolution (H, W) of the input image.
@@ -227,12 +247,13 @@ class ViT(nn.Module):
             n_layers (int): Number of Transformer encoder blocks.
         """
         super().__init__()
-        self.feature_extractor = Encoder(img_size, patch_size, img_channels, d_model, n_head, n_layers)
+        self.feature_extractor = Encoder(img_size, patch_size, in_channels, d_model, n_head, n_layers)
+
         self.linear_head = nn.Linear(d_model, num_classes, bias=False)
 
     def forward(self, x):
         """
-        Forward pass of the ViT.
+        Forward pass of the ImageClassifier.
 
         Args:
             x (torch.Tensor): Pre-tokenized patches [B, N, patch_size**2 * img_channels].
