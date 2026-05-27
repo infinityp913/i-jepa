@@ -439,12 +439,9 @@ class BDDDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, Union[torch.Tensor, int]]:
         img_path = self.image_paths[idx]
         img = self.transform(tvio.read_image(str(img_path), mode=tvio.ImageReadMode.RGB))
-        label = -1
-        if self.labels_dir:
-            label = tvio.read_image(str(self.labels_dir / f"{img_path.stem}_train_id.png"), mode=tvio.ImageReadMode.GRAY).squeeze(0).long()
         return (
             self.patcher(img.unsqueeze(0)).squeeze(0) if self.patcher else img,
-            label
+            tvio.read_image(str(self.labels_dir / f"{img_path.stem}_train_id.png")).squeeze(0).long() if self.labels_dir else -1
         )
 
 def make_bdd(
