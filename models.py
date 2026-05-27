@@ -224,11 +224,13 @@ class Predictor(nn.Module):
         Returns:
             torch.Tensor: Predicted embeddings at target positions [B, n_target, embed_dim].
         """
-        return self.proj(self.core(
+        y = self.core(
             torch.cat([self.embed(x), self.mask_token.expand(*y_masks.shape, -1)], dim=1),
             torch.cat([self.core.cos[x_masks], self.core.cos[y_masks]], dim=1),
             torch.cat([self.core.sin[x_masks], self.core.sin[y_masks]], dim=1)
-        )[:, x_masks.shape[1]:])
+        )[:, x_masks.shape[1]:]
+        
+        return self.proj(y)
 
 class ImageClassifier(nn.Module):
     """A Vision Transformer based image classifier."""
