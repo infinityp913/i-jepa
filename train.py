@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 import torch
 from tqdm import tqdm
 from data_utils import MaskCollator, apply_masks, make_transforms, make_imagenet, make_bdd, IMAGENET_SIZE, IMAGENET_NORMALIZATION, BDD_SIZE, BDD_NORMALIZATION
-from models import Encoder, Predictor, Tokenizer, ViT
+from models import Encoder, Predictor, Tokenizer, ImageClassifier
 from torch.nn.functional import smooth_l1_loss, mse_loss, cross_entropy
 import contextlib
 from torch.amp import autocast, GradScaler
@@ -529,7 +529,7 @@ def main():
         predictor = Predictor(
             img_size=BDD_SIZE,
             patch_size=patch_size,
-            embed_dim=encoder_dim,
+            in_channels=encoder_dim,
             d_model=predictor_dim,
             n_head=n_head,
             n_layers=6,
@@ -544,7 +544,7 @@ def main():
             run_name="bdd",
         )
     else:
-        vit = ViT(
+        classifier = ImageClassifier(
             img_size=BDD_SIZE,
             num_classes=100,
             patch_size=patch_size,
@@ -555,7 +555,7 @@ def main():
         
         trainer(
             **trainer_cfg,
-            model=vit,
+            model=classifier,
             pretrain_checkpoint="bdd_pretrain",
             full_tune=False,
             run_name="target",
@@ -569,6 +569,6 @@ def main():
             drop_last=False,
         )
 
-        evaluate(vit, test_loader, "target_finetune", device)
+        evaluate(classifier, test_loader, "target_finetune", device)
         
 if __name__ == "__main__": main()
